@@ -319,6 +319,9 @@ public:
     // return a copy of all model metadata (thread-safe)
     std::vector<server_model_meta> get_all_meta();
 
+    // capacity snapshot for the pool control channel, the models array of catalog 3.2 (thread-safe)
+    json pool_snapshot();
+
     struct load_options {
         server_child_mode mode = SERVER_CHILD_MODE_NORMAL;
         // used for spawning a downloading child process

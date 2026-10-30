@@ -5,6 +5,8 @@
 #include "server-cors-proxy.h"
 #include "server-stream.h"
 #include "server-tools.h"
+#include "pool/pool-config.h"
+#include "pool/pool-client.h"
 
 #include "arg.h"
 #include "build-info.h"
@@ -228,6 +230,16 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
         return 1;
     }
 
+    // pool control channel config; fail fast when --pool-server is misconfigured
+    pool::pool_config pool_cfg;
+    if (is_router_server && !params.pool_server.empty()) {
+        const std::string pool_cfg_err = pool::pool_config_init(params, pool_cfg);
+        if (!pool_cfg_err.empty()) {
+            SRV_ERR("pool: %s\n", pool_cfg_err.c_str());
+            return 1;
+        }
+    }
+
     if (is_router_server) {
         // setup server instances manager
         try {
@@ -448,6 +460,8 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
             SRV_INF("%s: cleaning up before exit...\n", __func__);
             // stop the session GC first, it finalizes live sessions and wakes pending readers
             server_stream_session_manager_stop();
+            // stop the pool before unloading models, so no capacity event races the shutdown
+            pool::pool_instance().stop();
             if (models_routes.has_value()) {
                 models_routes->stopping.store(true); // maybe redundant, but just to be safe
                 models_routes->models.unload_all();
@@ -480,6 +494,23 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
             ctx_http.join();
             clean_up();
             return 1;
+        }
+
+        // pool control channel; started after the startup models so the first handshake
+        // already carries them. a no-op path when --pool-server is not set
+        if (!params.pool_server.empty()) {
+            std::string pool_start_err;
+            if (!pool::pool_instance().start(pool_cfg, [&models_routes]() {
+                    return models_routes->models.pool_snapshot();
+                }, pool_start_err)) {
+                SRV_ERR("pool: failed to start: %s\n", pool_start_err.c_str());
+                ctx_http.stop();
+                ctx_http.join();
+                clean_up();
+                return 1;
+            }
+        } else {
+            SRV_INF("%s", "pool: not configured (no --pool-server)\n");
         }
 
     } else {

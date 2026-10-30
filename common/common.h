@@ -702,6 +702,10 @@ struct common_params {
     bool models_autoload = true;        // automatically load models when requested via the router server
     std::string models_preset_hf = "";  // show a warning about remote presets on router loaded (if not empty)
 
+    // pool control channel (router mode only, see tools/server/pool)
+    std::string pool_server = "";       // coordinator URL, e.g. https://pool.example.com; empty = pool off
+    std::string pool_name   = "";       // router display name; empty = hostname
+
     bool log_json = false;
 
     std::string slot_save_path;

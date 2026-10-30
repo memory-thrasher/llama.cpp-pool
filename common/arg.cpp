@@ -3709,6 +3709,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_AUTOLOAD"));
     add_opt(common_arg(
+        {"--pool-server"}, "URL",
+        "for router server, the pool coordinator URL; when set, the member token in the LLAMA_POOL_TOKEN env var is required (default: pool off)",
+        [](common_params & params, const std::string & value) {
+            params.pool_server = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_POOL_SERVER"));
+    add_opt(common_arg(
+        {"--pool-name"}, "NAME",
+        "for router server, the pool router display name (default: hostname)",
+        [](common_params & params, const std::string & value) {
+            params.pool_name = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_POOL_NAME"));
+    add_opt(common_arg(
         {"--jinja"},
         {"--no-jinja"},
         string_format("whether to use jinja template engine for chat (default: %s)", params.use_jinja ? "enabled" : "disabled"),

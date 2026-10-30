@@ -96,6 +96,8 @@ class ServerProcess:
     models_max: int | None = None
     models_preset: str | None = None
     no_models_autoload: bool | None = None
+    pool_server: str | None = None
+    pool_name: str | None = None
     lora_files: List[str] | None = None
     enable_ctx_shift: int | None = False
     spec_type: str | None = None
@@ -161,6 +163,13 @@ class ServerProcess:
             server_path = "../../../build/bin/Release/llama-server.exe"
         else:
             server_path = "../../../build/bin/llama-server"
+        # prefer the libraries next to the server binary so a stale system
+        # install in /usr/local/lib cannot shadow the build under test
+        if os.name != "nt":
+            lib_dir = os.path.dirname(os.path.abspath(server_path))
+            if os.path.exists(os.path.join(lib_dir, "libllama.so.0")):
+                prev = env.get("LD_LIBRARY_PATH", "")
+                env["LD_LIBRARY_PATH"] = lib_dir + (os.pathsep + prev if prev else "")
         server_args = [
             "--port",
             self.server_port,
@@ -186,6 +195,10 @@ class ServerProcess:
             server_args.extend(["--hf-file", self.model_hf_file])
         if self.models_dir:
             server_args.extend(["--models-dir", self.models_dir])
+        if self.pool_server:
+            server_args.extend(["--pool-server", self.pool_server])
+        if self.pool_name:
+            server_args.extend(["--pool-name", self.pool_name])
         if self.models_max is not None:
             server_args.extend(["--models-max", self.models_max])
         if self.models_preset:

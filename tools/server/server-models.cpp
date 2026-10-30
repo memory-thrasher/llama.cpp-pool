@@ -11,6 +11,8 @@
 #include "http.h"
 #include "subproc.h"
 
+#include "pool/pool-client.h"
+
 #include <cpp-httplib/httplib.h> // TODO: remove this once we use HTTP client from download.h
 #include <optional>
 
@@ -1292,6 +1294,55 @@ std::vector<server_model_meta> server_models::get_all_meta() {
     return result;
 }
 
+json server_models::pool_snapshot() {
+    std::lock_guard<std::mutex> lk(mutex);
+    json models = json::array();
+    for (const auto & [name, inst] : mapping) {
+        const auto & meta = inst.meta;
+        // only running instances count as pool capacity
+        if (!meta.is_ready_or_sleep()) {
+            continue;
+        }
+        // context and embedding dim from the child's model info, fall back to the GGUF metadata
+        uint64_t n_ctx  = meta.n_ctx_train;
+        uint64_t n_embd = 0;
+        if (meta.loaded_info.is_object() && meta.loaded_info.contains("meta") && meta.loaded_info["meta"].is_object()) {
+            const json & child = meta.loaded_info["meta"];
+            const uint64_t v = child.value("n_ctx", (uint64_t) 0);
+            if (v > 0) {
+                n_ctx = v;
+            }
+            n_embd = child.value("n_embd", (uint64_t) 0);
+        }
+        if (n_ctx  == 0) n_ctx  = 1;
+        if (n_embd == 0) n_embd = 1;
+
+        // parallel slots come from the child args; unset and auto (-1) fall back to 1
+        int64_t n_slots = 1;
+        std::string par;
+        if (meta.preset.get_option("LLAMA_ARG_N_PARALLEL", par)) {
+            try {
+                n_slots = std::stoll(par);
+            } catch (const std::exception &) {}
+        }
+        if (n_slots < 1) {
+            n_slots = 1;
+        }
+
+        models.push_back({
+            {"model_id",   meta.name},
+            {"tags",       meta.tags},
+            {"n_ctx",      n_ctx},
+            {"n_embd",     n_embd},
+            {"n_slots",    (uint64_t) n_slots},
+            {"busy_slots", std::min<uint64_t>((uint64_t) inst.req_count, (uint64_t) n_slots)},
+            {"status",     meta.status == SERVER_MODEL_STATUS_SLEEPING ? "sleeping" : "loaded"},
+            {"vram_mb",    nullptr},
+        });
+    }
+    return models;
+}
+
 void server_models::unload_lru() {
     if (base_params.models_max <= 0) {
         return; // no limit
@@ -1626,6 +1677,14 @@ void server_models::update_status(const std::string & name, const update_status_
         notify_sse("status_change", name, data);
     }
     cv.notify_all();
+
+    // a state change alters the pool capacity. the pool thread takes this mutex to build
+    // its snapshot, so unlock first; pool_on_capacity_change() is a no-op when the pool is off
+    if (args.status == SERVER_MODEL_STATUS_LOADED || args.status == SERVER_MODEL_STATUS_UNLOADED
+            || args.status == SERVER_MODEL_STATUS_SLEEPING) {
+        lk.unlock();
+        pool::pool_on_capacity_change();
+    }
 }
 
 void server_models::update_download_progress(const std::string & name, const common_download_progress & progress, bool done, bool ok) {

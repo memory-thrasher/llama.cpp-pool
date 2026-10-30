@@ -47,6 +47,10 @@ add_library(${TARGET}
     server-http.h
     server-models.cpp
     server-models.h
+    pool/pool-config.cpp
+    pool/pool-config.h
+    pool/pool-client.cpp
+    pool/pool-client.h
 )
 set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
