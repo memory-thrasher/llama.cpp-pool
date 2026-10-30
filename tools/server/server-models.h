@@ -7,6 +7,8 @@
 #include "server-http.h"
 #include "server-queue.h"
 
+#include "pool/pool-classes.h"
+
 #include <mutex>
 #include <condition_variable>
 #include <thread>
@@ -321,6 +323,8 @@ public:
 
     // capacity snapshot for the pool control channel, the models array of catalog 3.2 (thread-safe)
     json pool_snapshot();
+    // the loaded members carrying pool tags, one entry per (model, tag)
+    std::vector<pool::pool_local_member> pool_local_members();
 
     struct load_options {
         server_child_mode mode = SERVER_CHILD_MODE_NORMAL;
@@ -418,7 +422,8 @@ struct server_models_routes {
     json ui_settings = json::object();     // Primary: new name
     std::atomic<bool> stopping = false;    // for graceful disconnecting SSE clients during shutdown
     server_models models;
-    server_models_routes(const common_params & params, int argc, char ** argv)
+    std::unique_ptr<pool::pool_classes> pool_classes;
+    server_models_routes(const common_params & params, int argc, char ** argv, const pool::pool_config & pool_cfg)
             : params(params), models(params, argc, argv) {
         const std::string & cfg = this->params.ui_config_json;
         if (!cfg.empty()) {
@@ -430,6 +435,9 @@ struct server_models_routes {
                 throw;
             }
         }
+        pool_classes = std::make_unique<pool::pool_classes>(pool_cfg, [this]() {
+            return models.pool_local_members();
+        });
         init_routes();
     }
 

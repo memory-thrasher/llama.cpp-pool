@@ -243,7 +243,7 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
     if (is_router_server) {
         // setup server instances manager
         try {
-            models_routes.emplace(params, argc, argv);
+            models_routes.emplace(params, argc, argv, pool_cfg);
         } catch (const std::exception & e) {
             SRV_ERR("failed to initialize router models: %s\n", e.what());
             return 1;

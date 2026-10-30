@@ -1343,6 +1343,64 @@ json server_models::pool_snapshot() {
     return models;
 }
 
+std::vector<pool::pool_local_member> server_models::pool_local_members() {
+    std::lock_guard<std::mutex> lk(mutex);
+    std::vector<pool::pool_local_member> out;
+    for (const auto & [name, inst] : mapping) {
+        const auto & meta = inst.meta;
+        // same membership rule as pool_snapshot: a loaded or sleeping instance
+        if (!meta.is_ready_or_sleep()) {
+            continue;
+        }
+        bool has_pool_tag = false;
+        for (const auto & tag : meta.tags) {
+            if (tag.rfind("pool-", 0) == 0) {
+                has_pool_tag = true;
+                break;
+            }
+        }
+        if (!has_pool_tag) {
+            continue;
+        }
+
+        // context from the child's model info, fall back to the GGUF metadata
+        uint64_t n_ctx = meta.n_ctx_train;
+        if (meta.loaded_info.is_object() && meta.loaded_info.contains("meta") && meta.loaded_info["meta"].is_object()) {
+            const uint64_t v = meta.loaded_info["meta"].value("n_ctx", (uint64_t) 0);
+            if (v > 0) {
+                n_ctx = v;
+            }
+        }
+        if (n_ctx == 0) n_ctx = 1;
+
+        // parallel slots come from the child args; unset and auto (-1) fall back to 1
+        int64_t n_slots = 1;
+        std::string par;
+        if (meta.preset.get_option("LLAMA_ARG_N_PARALLEL", par)) {
+            try {
+                n_slots = std::stoll(par);
+            } catch (const std::exception &) {}
+        }
+        if (n_slots < 1) {
+            n_slots = 1;
+        }
+
+        for (const auto & tag : meta.tags) {
+            if (tag.rfind("pool-", 0) != 0) {
+                continue; // the pool- prefix is reserved for classes
+            }
+            out.push_back({
+                tag,
+                meta.name,
+                n_ctx,
+                (uint64_t) n_slots,
+                std::min<uint64_t>((uint64_t) inst.req_count, (uint64_t) n_slots),
+            });
+        }
+    }
+    return out;
+}
+
 void server_models::unload_lru() {
     if (base_params.models_max <= 0) {
         return; // no limit
@@ -2298,13 +2356,44 @@ static void res_err(std::unique_ptr<server_http_res> & res, const json & error_d
     res->data = safe_json_to_str({{ "error", error_data }});
 }
 
-static bool router_validate_model(std::string & name, server_models & models, bool models_autoload, std::unique_ptr<server_http_res> & res) {
+// map a request naming a pool class to one of its local members (D-D1): the
+// class is valid iff it has membership (D-C1/D-C7), a request with no local
+// free slot is a retryable busy until WS-05 routes it through the queue
+static bool router_resolve_pool_class(const std::string & tag, int64_t est_ctx,
+                                      pool::pool_classes & pool_classes, std::string & member) {
+    const auto ads = pool_classes.get();
+    const auto it = ads.find(tag);
+    if (it == ads.end() || it->second.member_count < 1) {
+        return false; // no membership anywhere, the canonical no-membership error
+    }
+    member = pool_classes.pick_local_member(tag, est_ctx);
+    return true;
+}
+
+static bool router_validate_model(std::string & name, server_models & models, bool models_autoload,
+                                  pool::pool_classes * pool_classes, int64_t est_ctx,
+                                  std::unique_ptr<server_http_res> & res) {
     if (name.empty()) {
         res_err(res, format_error_response("model name is missing from the request", ERROR_TYPE_INVALID_REQUEST));
         return false;
     }
     auto meta = models.get_meta(name);
     if (!meta.has_value()) {
+        if (pool_classes && name.rfind("pool-", 0) == 0) {
+            std::string member;
+            if (!router_resolve_pool_class(name, est_ctx, *pool_classes, member)) {
+                res_err(res, format_error_response("model is not loaded", ERROR_TYPE_INVALID_REQUEST));
+                return false;
+            }
+            if (member.empty()) {
+                // TODO(WS-05): enqueue on the coordinator (D-D1) instead of refusing;
+                // 503 is retryable, the client sees a neutral busy error
+                res_err(res, format_error_response("server is busy", ERROR_TYPE_UNAVAILABLE));
+                return false;
+            }
+            name = member;
+            return true;
+        }
         res_err(res, format_error_response(string_format("model '%s' not found", name.c_str()), ERROR_TYPE_INVALID_REQUEST));
         return false;
     }
@@ -2398,6 +2487,35 @@ void server_models_routes::init_routes() {
             res_ok(res, props);
             return res;
         }
+        // an advertised pool class: synthetic props with the advertised context,
+        // no proxy. a model literally named after the tag keeps its real props
+        if (pool_classes && !models.has_model(name) && name.rfind("pool-", 0) == 0) {
+            const auto ads = pool_classes->get();
+            const auto it = ads.find(name);
+            if (it != ads.end()) {
+                auto res = std::make_unique<server_http_res>();
+                const uint64_t n_ctx = it->second.advertised_ctx;
+                json pool_props = {
+                    // TODO: add support for this on web UI
+                    {"role",                 "router"},
+                    {"max_instances",        params.models_max},
+                    {"models_autoload",      params.models_autoload},
+                    {"model_alias",          name},
+                    {"model_path",           "none"},
+                    {"default_generation_settings", {
+                        {"params", json{}},
+                        {"n_ctx",  n_ctx},
+                    }},
+                    {"n_ctx",                n_ctx},
+                    // New key
+                    {"ui_settings",          ui_settings},
+                    {"build_info",           std::string(llama_build_info())},
+                    {"cors_proxy_enabled",   params.ui_mcp_proxy},
+                };
+                res_ok(res, pool_props);
+                return res;
+            }
+        }
         return proxy_get(req);
     };
 
@@ -2406,7 +2524,7 @@ void server_models_routes::init_routes() {
         std::string name = req.get_param("model");
         bool autoload = is_autoload(params, req);
         auto error_res = std::make_unique<server_http_res>();
-        if (!router_validate_model(name, models, autoload, error_res)) {
+        if (!router_validate_model(name, models, autoload, pool_classes.get(), 0, error_res)) {
             return error_res;
         }
         if (autoload) {
@@ -2419,7 +2537,7 @@ void server_models_routes::init_routes() {
         std::string name = req.get_param("model");
         bool autoload = is_autoload(params, req);
         auto error_res = std::make_unique<server_http_res>();
-        if (!router_validate_model(name, models, autoload, error_res)) {
+        if (!router_validate_model(name, models, autoload, pool_classes.get(), 0, error_res)) {
             // error_res holds {"error": {...}}, send it as a websocket error event
             json err = json::parse(error_res->data);
             err["type"] = "error";
@@ -2439,7 +2557,9 @@ void server_models_routes::init_routes() {
         std::string name = json_value(body, "model", std::string());
         bool autoload = is_autoload(params, req);
         auto error_res = std::make_unique<server_http_res>();
-        if (!router_validate_model(name, models, autoload, error_res)) {
+        // the context the request is expected to need, for the member selection
+        const int64_t est_ctx = json_value(body, "n_ctx", (int64_t) 0);
+        if (!router_validate_model(name, models, autoload, pool_classes.get(), est_ctx, error_res)) {
             return error_res;
         }
         // remember which child serves this conversation so the stream routes can route straight
@@ -2599,6 +2719,32 @@ void server_models_routes::init_routes() {
                 {"can_remove",   true},
                 {"sidecars",     d.sidecars},
             });
+        }
+
+        // one synthetic entry per advertised pool class (D-C1); a tag that is
+        // also a real model keeps its real entry. status stays "loaded" (D-C2)
+        if (pool_classes) {
+            for (auto & [tag, ad] : pool_classes->get()) {
+                if (models.has_model(tag)) {
+                    continue;
+                }
+                models_json.push_back(json {
+                    {"id",            tag},
+                    {"aliases",       json::array()},
+                    {"tags",          json::array({tag})},
+                    {"object",        "model"},
+                    {"owned_by",      "llamacpp"},
+                    {"created",       t},
+                    {"status",        json {{"value", "loaded"}, {"args", ""}}},
+                    {"context_length", ad.advertised_ctx},
+                    // additive metadata for the pool, harmless to other clients
+                    {"pool",          json {
+                        {"member_count", ad.member_count},
+                        {"min_ctx",      ad.min_ctx},
+                        {"max_ctx",      ad.max_ctx},
+                    }},
+                });
+            }
         }
 
         res_ok(res, {
