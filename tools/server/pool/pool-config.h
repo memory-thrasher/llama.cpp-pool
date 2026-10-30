@@ -20,4 +20,7 @@ struct pool_config {
 // build the config from CLI params and env vars.
 // returns an empty string on success, a startup error message otherwise
 std::string pool_config_init(const common_params & params, pool_config & out);
+
+// a fresh random UUIDv4 (lowercase), e.g. the intake request_id
+std::string new_uuid();
 }

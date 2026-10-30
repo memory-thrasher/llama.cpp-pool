@@ -478,18 +478,8 @@ bool pool_client::start(const pool_config & cfg, std::function<json()> capacity_
     st->capacity_snapshot = std::move(capacity_snapshot);
     st->bus = &bus_;
 
-    // WS-03 marker handler for work_offer; WS-05 replaces it with the real dispatch
-    bus_.subscribe([](const json & env) {
-        if (json_str(env, "type") != "work_offer") {
-            return;
-        }
-        std::string job_id, tag;
-        if (env.contains("payload") && env["payload"].is_object()) {
-            job_id = json_str(env["payload"], "job_id");
-            tag    = json_str(env["payload"], "tag");
-        }
-        LOG_INF("pool: work_offer job_id=%s tag=%s\n", job_id.c_str(), tag.c_str());
-    });
+    // work_offer is handled by the pool dispatch core (pool-dispatch.cpp), which
+    // subscribes to this bus; nothing to register here
 
     try {
         st->start();

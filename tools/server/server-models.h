@@ -8,6 +8,7 @@
 #include "server-queue.h"
 
 #include "pool/pool-classes.h"
+#include "pool/pool-dispatch.h"
 
 #include <mutex>
 #include <condition_variable>
@@ -423,8 +424,10 @@ struct server_models_routes {
     std::atomic<bool> stopping = false;    // for graceful disconnecting SSE clients during shutdown
     server_models models;
     std::unique_ptr<pool::pool_classes> pool_classes;
+    std::unique_ptr<pool::pool_dispatch> pool_dispatch;
+    pool::pool_config pool_cfg_;
     server_models_routes(const common_params & params, int argc, char ** argv, const pool::pool_config & pool_cfg)
-            : params(params), models(params, argc, argv) {
+            : params(params), models(params, argc, argv), pool_cfg_(pool_cfg) {
         const std::string & cfg = this->params.ui_config_json;
         if (!cfg.empty()) {
             try {
@@ -438,6 +441,7 @@ struct server_models_routes {
         pool_classes = std::make_unique<pool::pool_classes>(pool_cfg, [this]() {
             return models.pool_local_members();
         });
+        pool_dispatch = std::make_unique<pool::pool_dispatch>(pool_cfg, models, *pool_classes);
         init_routes();
     }
 

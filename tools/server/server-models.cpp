@@ -2356,9 +2356,12 @@ static void res_err(std::unique_ptr<server_http_res> & res, const json & error_d
     res->data = safe_json_to_str({{ "error", error_data }});
 }
 
+// how a validated request should be routed
+enum class route_kind { k_local, k_pool_enqueue, k_error };
+
 // map a request naming a pool class to one of its local members (D-D1): the
-// class is valid iff it has membership (D-C1/D-C7), a request with no local
-// free slot is a retryable busy until WS-05 routes it through the queue
+// class is valid iff it has membership (D-C1/D-C7); no local free member means
+// the caller enqueues the job on the coordinator
 static bool router_resolve_pool_class(const std::string & tag, int64_t est_ctx,
                                       pool::pool_classes & pool_classes, std::string & member) {
     const auto ads = pool_classes.get();
@@ -2370,12 +2373,12 @@ static bool router_resolve_pool_class(const std::string & tag, int64_t est_ctx,
     return true;
 }
 
-static bool router_validate_model(std::string & name, server_models & models, bool models_autoload,
-                                  pool::pool_classes * pool_classes, int64_t est_ctx,
-                                  std::unique_ptr<server_http_res> & res) {
+static route_kind router_validate_model(std::string & name, server_models & models, bool models_autoload,
+                                        pool::pool_classes * pool_classes, int64_t est_ctx,
+                                        std::unique_ptr<server_http_res> & res) {
     if (name.empty()) {
         res_err(res, format_error_response("model name is missing from the request", ERROR_TYPE_INVALID_REQUEST));
-        return false;
+        return route_kind::k_error;
     }
     auto meta = models.get_meta(name);
     if (!meta.has_value()) {
@@ -2383,27 +2386,25 @@ static bool router_validate_model(std::string & name, server_models & models, bo
             std::string member;
             if (!router_resolve_pool_class(name, est_ctx, *pool_classes, member)) {
                 res_err(res, format_error_response("model is not loaded", ERROR_TYPE_INVALID_REQUEST));
-                return false;
+                return route_kind::k_error;
             }
             if (member.empty()) {
-                // TODO(WS-05): enqueue on the coordinator (D-D1) instead of refusing;
-                // 503 is retryable, the client sees a neutral busy error
-                res_err(res, format_error_response("server is busy", ERROR_TYPE_UNAVAILABLE));
-                return false;
+                // no local free member: the caller enqueues on the coordinator (D-D1)
+                return route_kind::k_pool_enqueue;
             }
             name = member;
-            return true;
+            return route_kind::k_local;
         }
         res_err(res, format_error_response(string_format("model '%s' not found", name.c_str()), ERROR_TYPE_INVALID_REQUEST));
-        return false;
+        return route_kind::k_error;
     }
     // resolve alias to canonical model name
     name = meta->name;
     if (!models_autoload && !meta->is_running()) {
         res_err(res, format_error_response("model is not loaded", ERROR_TYPE_INVALID_REQUEST));
-        return false;
+        return route_kind::k_error;
     }
-    return true;
+    return route_kind::k_local;
 }
 
 static bool is_autoload(const common_params & params, const server_http_req & req) {
@@ -2524,7 +2525,13 @@ void server_models_routes::init_routes() {
         std::string name = req.get_param("model");
         bool autoload = is_autoload(params, req);
         auto error_res = std::make_unique<server_http_res>();
-        if (!router_validate_model(name, models, autoload, pool_classes.get(), 0, error_res)) {
+        route_kind kind = router_validate_model(name, models, autoload, pool_classes.get(), 0, error_res);
+        if (kind == route_kind::k_error) {
+            return error_res;
+        }
+        if (kind == route_kind::k_pool_enqueue) {
+            // only the chat/completions POST is enqueued, a GET stays a neutral busy
+            res_err(error_res, format_error_response("server is busy", ERROR_TYPE_UNAVAILABLE));
             return error_res;
         }
         if (autoload) {
@@ -2537,7 +2544,12 @@ void server_models_routes::init_routes() {
         std::string name = req.get_param("model");
         bool autoload = is_autoload(params, req);
         auto error_res = std::make_unique<server_http_res>();
-        if (!router_validate_model(name, models, autoload, pool_classes.get(), 0, error_res)) {
+        route_kind kind = router_validate_model(name, models, autoload, pool_classes.get(), 0, error_res);
+        if (kind != route_kind::k_local) {
+            // a websocket is not enqueued; k_error carries the message, enqueue is neutral busy
+            if (kind == route_kind::k_pool_enqueue) {
+                res_err(error_res, format_error_response("server is busy", ERROR_TYPE_UNAVAILABLE));
+            }
             // error_res holds {"error": {...}}, send it as a websocket error event
             json err = json::parse(error_res->data);
             err["type"] = "error";
@@ -2559,8 +2571,16 @@ void server_models_routes::init_routes() {
         auto error_res = std::make_unique<server_http_res>();
         // the context the request is expected to need, for the member selection
         const int64_t est_ctx = json_value(body, "n_ctx", (int64_t) 0);
-        if (!router_validate_model(name, models, autoload, pool_classes.get(), est_ctx, error_res)) {
+        route_kind kind = router_validate_model(name, models, autoload, pool_classes.get(), est_ctx, error_res);
+        if (kind == route_kind::k_error) {
             return error_res;
+        }
+        if (kind == route_kind::k_pool_enqueue) {
+            // no local free member for the class: enqueue on the coordinator (D-D1)
+            // and relay the response back to the client. the prompt estimate is the
+            // body size over four, a cheap token proxy
+            const int64_t est_prompt = (int64_t)(req.body.size() / 4);
+            return pool_dispatch->origin_request(name, req.body, est_prompt, est_ctx);
         }
         // remember which child serves this conversation so the stream routes can route straight
         // to it without polling, keyed on the exact conv id from the header. registered before

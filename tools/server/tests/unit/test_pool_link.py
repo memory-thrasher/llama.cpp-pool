@@ -372,7 +372,7 @@ def test_pool_work_offer_via_sse(tmp_path, coordinator):
         coordinator.wait_for("handshake", lambda e: True)
         coordinator.wait_for_sse()
         coordinator.send_work_offer("job-sse-1", tag="link-test")
-        _wait_log(server, "pool: work_offer job_id=job-sse-1 tag=link-test")
+        _wait_log(server, "pool: offer job_id=job-sse-1 tag=link-test")
     finally:
         server.stop()
 
@@ -406,6 +406,6 @@ def test_pool_work_offer_via_long_poll(tmp_path, coordinator):
         env = coordinator.wait_for("handshake", lambda e: True)
         assert env["payload"]["router_name"] == ROUTER_NAME
         coordinator.send_work_offer("job-poll-1", tag="link-test")
-        _wait_log(server, "pool: work_offer job_id=job-poll-1 tag=link-test")
+        _wait_log(server, "pool: offer job_id=job-poll-1 tag=link-test")
     finally:
         server.stop()

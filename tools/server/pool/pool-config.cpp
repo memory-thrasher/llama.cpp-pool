@@ -97,6 +97,10 @@ std::string load_or_create_router_id(const std::string & path) {
 
 } // namespace
 
+std::string new_uuid() {
+    return generate_router_id();
+}
+
 std::string pool_config_init(const common_params & params, pool_config & out) {
     out = pool_config{};
     if (params.pool_server.empty()) {
