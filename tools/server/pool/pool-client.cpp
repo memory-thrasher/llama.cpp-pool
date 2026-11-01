@@ -229,7 +229,17 @@ struct pool_client::state {
         int backoff_s = 1;
 
         while (!stopping.load()) {
-            const bool ok = use_poll ? poll_round(announced) : sse_round(announced);
+            // e2e fix: the coordinator requires the routers row to exist before
+            // it accepts the subscribe link, and that row is created by the
+            // handshake event. the previous ordering (handshake queued only
+            // after the subscribe connected) deadlocked against such a
+            // coordinator: the subscribe was rejected, so the handshake was
+            // never sent. send it synchronously first; on failure the subscribe
+            // round still runs and logs its own failure (degraded mode)
+            if (!announced) {
+                announced = post_event("handshake", handshake_payload());
+            }
+            const bool ok = use_poll ? poll_round() : sse_round();
             if (stopping.load()) {
                 break;
             }
@@ -256,7 +266,7 @@ struct pool_client::state {
         }
     }
 
-    bool sse_round(bool & announced) {
+    bool sse_round() {
         auto cli = std::make_shared<httplib::Client>(cfg.server);
         cli->set_connection_timeout(CONNECT_TIMEOUT_S);
         cli->set_read_timeout(SSE_READ_TIMEOUT_S);
@@ -274,21 +284,19 @@ struct pool_client::state {
             {"Accept", "text/event-stream"},
             {"Authorization", "Bearer " + cfg.token},
             {"X-Pool-Proto", std::to_string(PROTO_VERSION)},
+            // e2e fix: the coordinator identifies the router by this header
+            // on the subscribe link (additive contract, as on POST /pool/jobs)
+            {"X-Pool-Router-Id", cfg.router_id},
         };
 
         const auto t0 = std::chrono::steady_clock::now();
         auto res = cli->Get("/pool/subscribe", headers,
-            [this, &connected, &announced](const httplib::Response & r) -> bool {
+            [this, &connected](const httplib::Response & r) -> bool {
                 if (r.status != 200) {
                     LOG_WRN("pool: subscribe failed: status=%d\n", r.status);
                     return false;
                 }
                 connected = true;
-                // first message after (re)connect, before any other
-                if (!announced) {
-                    queue_event("handshake", handshake_payload());
-                    announced = true;
-                }
                 return true;
             },
             [&buf, &data, this](const char * d, size_t len) -> bool {
@@ -375,7 +383,7 @@ struct pool_client::state {
         bus->post(env);
     }
 
-    bool poll_round(bool & announced) {
+    bool poll_round() {
         httplib::Client cli(cfg.server);
         cli.set_connection_timeout(CONNECT_TIMEOUT_S);
         cli.set_read_timeout(POLL_READ_TIMEOUT_S);
@@ -384,6 +392,7 @@ struct pool_client::state {
             {"Accept", "application/json"},
             {"Authorization", "Bearer " + cfg.token},
             {"X-Pool-Proto", std::to_string(PROTO_VERSION)},
+            {"X-Pool-Router-Id", cfg.router_id}, // e2e fix: see sse_round
         };
         auto res = cli.Get("/pool/subscribe", headers);
         if (!res) {
@@ -393,11 +402,6 @@ struct pool_client::state {
         if (res->status != 200) {
             LOG_WRN("pool: long-poll failed: status=%d\n", res->status);
             return false;
-        }
-        // first message after (re)connect, before any other
-        if (!announced) {
-            queue_event("handshake", handshake_payload());
-            announced = true;
         }
         json offers;
         try {

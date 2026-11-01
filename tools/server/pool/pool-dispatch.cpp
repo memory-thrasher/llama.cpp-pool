@@ -272,6 +272,8 @@ std::string pool_dispatch::pull_body(const std::string & job_id) const {
     const httplib::Headers headers = {
         {"Authorization", "Bearer " + cfg_.token},
         {"X-Pool-Proto", std::to_string(PROTO_VERSION)},
+        // e2e fix: the coordinator requires the router identity on the body pull
+        {"X-Pool-Router-Id", cfg_.router_id},
     };
     auto res = cli.Get("/pool/jobs/" + job_id + "/body", headers);
     if (!res) {
@@ -299,6 +301,8 @@ bool pool_dispatch::push_response(const std::string & job_id, const std::string 
     const httplib::Headers headers = {
         {"Authorization", "Bearer " + cfg_.token},
         {"X-Pool-Proto", std::to_string(PROTO_VERSION)},
+        // e2e fix: the coordinator requires the router identity on the response push
+        {"X-Pool-Router-Id", cfg_.router_id},
         {"Content-Type", "application/x-ndjson"},
     };
     auto res = cli.Put("/pool/jobs/" + job_id + "/response", headers, body, "application/x-ndjson");
