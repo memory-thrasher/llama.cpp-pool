@@ -79,6 +79,10 @@ class FakeCoordinator:
         self.last_auth = ""
         self.sse_subs: list["queue.Queue"] = []
         self.pending_offers: list[dict] = []
+        # job_id -> {"message": str, "keep_lines": int}; the response relay is
+        # cut mid-stream (the serving member died) and the terminal error is
+        # mirrored, exactly as the coordinator's running cap does (D-G2)
+        self.mid_stream_death: dict[str, dict] = {}
         self._next_job = itertools.count(1)
         self._httpd = ThreadingHTTPServer(("127.0.0.1", self.port), self._make_handler())
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
@@ -94,6 +98,26 @@ class FakeCoordinator:
     def intake_count(self) -> int:
         with self.lock:
             return len(self.intakes)
+
+    def arm_mid_stream_death(self, job_id: str, message: str = "service timeout after 2s (D-G2)",
+                             keep_lines: int = 4) -> None:
+        """the relay is cut after keep_lines, then the terminal error envelope is
+        mirrored (event first, relay close after - the coordinator's order)"""
+        with self.lock:
+            self.mid_stream_death[job_id] = {"message": message, "keep_lines": keep_lines}
+
+    def send_terminal(self, job_id: str, ok: bool, message: str = "") -> None:
+        """mirror a terminal envelope (completion / error) onto the subscribe stream"""
+        payload: dict = {"job_id": job_id, "ok": ok}
+        if ok:
+            payload.update({"model_id": "", "served_by": ""})
+        else:
+            payload.update({"stage": "mid_stream", "code": "other", "message": message})
+        env = {"type": "completion" if ok else "error", "payload": payload}
+        with self.lock:
+            subs = list(self.sse_subs)
+        for q in subs:
+            q.put(env)
 
     def send_work_offer(self, job_id: str, tag: str, est_ctx: int = 0, est_prompt: int = 0,
                         conv_key: str | None = None) -> None:
@@ -251,6 +275,17 @@ class FakeCoordinator:
                 h._send_json({"error": "unknown job"}, 404)
                 return
             job.pushed_lines = lines
+            death = self.mid_stream_death.pop(job_id, None)
+        if death is not None:
+            # the serving member died mid-push: the coordinator's running cap
+            # mirrors the terminal error and cuts the relay (no child [DONE])
+            self.send_terminal(job_id, ok=False, message=death["message"])
+            kept = [l for l in lines if l.strip() != "data: [DONE]"][: death["keep_lines"]]
+            for line in kept:
+                job.resp_queue.put(line)
+            job.resp_queue.put(None)
+            h._send_json({"ok": True})
+            return
         # relay the lines to the held-open GET, in order, then close it
         for line in lines:
             job.resp_queue.put(line)
@@ -641,6 +676,220 @@ def test_dispatch_origin_serve_roundtrip(tmp_path, coordinator):
             assert PROMPT_MARKER not in log, "the prompt marker leaked into the router log"
             # the job id and model id may appear (metadata)
             assert job_id in log or LOCAL_MODEL_ID in log
+        finally:
+            t_long.join(timeout=180)
+    finally:
+        server.stop()
+
+
+#
+# WS-09 Part A: the D-J5 error taxonomy (hold / give-up / retry / interrupted)
+#
+
+
+def test_dispatch_hold_while_member_busy(tmp_path, coordinator):
+    """A.1/D-J5 HOLD: a request for a class whose only member is busy holds the
+    client - 200 + open socket, ZERO content bytes until the member serves,
+    then the stream (pi waits; its own timeout governs)"""
+    import http.client
+    import select
+
+    preset = str(tmp_path / "preset.ini")
+    _write_preset(preset, LOCAL_MODEL_ID, POOL_TEXT_MD)
+    server = _start_router(tmp_path, coordinator.url(), preset)
+    try:
+        _load_model(server, LOCAL_MODEL_ID)
+        _wait_for_entry(server, POOL_TEXT_MD)
+        coordinator.wait_for("handshake", lambda e: True)
+        coordinator.wait_for_sse()
+
+        # the only member's (single) slot is busy
+        t_long, _ = _occupy_slot(server, LOCAL_MODEL_ID)
+        try:
+            body = json.dumps({
+                "model": POOL_TEXT_MD,
+                "stream": True,
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hold test"}],
+            })
+            conn = http.client.HTTPConnection(
+                server.server_host.split(",")[0].strip(), server.server_port, timeout=60)
+            conn.request("POST", "/v1/chat/completions", body=body,
+                         headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            assert resp.status == 200
+            assert resp.getheader("Content-Type", "").startswith("text/event-stream")
+
+            # the job is queued (the member is still busy): zero content bytes
+            readable, _, _ = select.select([resp.fp], [], [], 2.0)
+            assert not readable, "content bytes arrived while the member was still busy"
+
+            intake = _wait_intake(coordinator)
+            job_id = intake["job_id"]
+
+            # free the member and serve: now the stream arrives
+            t_long.join(timeout=180)
+            coordinator.send_work_offer(job_id, tag=POOL_TEXT_MD, est_ctx=256, est_prompt=16,
+                                        conv_key=intake["metadata"].get("conv_key"))
+            chunks = []
+            while True:
+                c = resp.read(4096)
+                if not c:
+                    break
+                chunks.append(c)
+            data = b"".join(chunks)
+            assert b"data: " in data, data[:200]
+            assert b"[DONE]" in data, data[-200:]
+        finally:
+            t_long.join(timeout=180)
+    finally:
+        server.stop()
+
+
+def test_dispatch_give_up_no_members(tmp_path):
+    """A.2/D-J5 GIVE-UP: a class with no members at all (nowhere, not local)
+    -> neutral 4xx with the canonical wording, and no busy wording that stock
+    pi would retry on"""
+    # pool-text-lg has no membership anywhere: not listed by the coordinator,
+    # no local model carries that tag
+    ad = {"protocol": 1, "classes": [
+        {"tag": POOL_TEXT_MD, "member_count": 1, "advertised_ctx": 1024,
+         "min_ctx": 1024, "max_ctx": 1024},
+    ]}
+    coordinator = FakeCoordinator(classes=ad)
+    preset = str(tmp_path / "preset.ini")
+    _write_preset(preset, LOCAL_MODEL_ID, POOL_TEXT_MD)
+    server = _start_router(tmp_path, coordinator.url(), preset)
+    try:
+        _load_model(server, LOCAL_MODEL_ID)
+        _wait_for_entry(server, POOL_TEXT_MD)
+
+        # pool-text-lg has no member at all: not local (no model with that
+        # tag), not on the coordinator (the advertisement lists no such class
+        # with membership)
+        res = server.make_request("POST", "/v1/chat/completions", data={
+            "model": POOL_TEXT_LG,
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "give up test"}],
+        })
+        assert res.status_code == 400, res.status_code
+        err = res.body.get("error")
+        assert err is not None, res.body
+        assert err.get("message") == "model is not loaded", err
+        # neutral wording: nothing stock pi would auto-retry on
+        s = json.dumps(res.body).lower()
+        for word in ("overloaded", "server_busy", "at capacity", "rate limit",
+                     "unavailable", "server_error", "retry"):
+            assert word not in s, (word, s)
+    finally:
+        server.stop()
+        coordinator.stop()
+
+
+def test_dispatch_retry_coordinator_down(tmp_path):
+    """A.3/D-J5 RETRY: the coordinator is unreachable (dead port) -> 5xx with
+    busy wording in the body, so stock pi's retry pattern matches"""
+    coordinator = FakeCoordinator()
+    preset = str(tmp_path / "preset.ini")
+    _write_preset(preset, LOCAL_MODEL_ID, POOL_TEXT_MD)
+    server = _start_router(tmp_path, coordinator.url(), preset)
+    try:
+        _load_model(server, LOCAL_MODEL_ID)
+        _wait_for_entry(server, POOL_TEXT_MD)
+        coordinator.wait_for("handshake", lambda e: True)
+
+        # the coordinator goes away; the advertisements are already cached
+        coordinator.stop()
+
+        # the only member's slot is busy, so the request must intake - on the
+        # dead port
+        t_long, _ = _occupy_slot(server, LOCAL_MODEL_ID)
+        try:
+            res = server.make_request("POST", "/v1/chat/completions", data={
+                "model": POOL_TEXT_MD,
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "retry test"}],
+            })
+            assert res.status_code in (502, 503), res.status_code
+            s = json.dumps(res.body)
+            assert "server_busy" in s or "overloaded" in s, s
+        finally:
+            t_long.join(timeout=180)
+    finally:
+        server.stop()
+
+
+def test_dispatch_mid_stream_death(tmp_path, coordinator):
+    """A.4/D-G2: the stream started and then the serving member died (the
+    coordinator's running cap cut the relay and mirrored the terminal error).
+    The client sees a clean, structured end-of-stream error - not a raw hang,
+    not a half-open socket"""
+    preset = str(tmp_path / "preset.ini")
+    _write_preset(preset, LOCAL_MODEL_ID, POOL_TEXT_MD)
+    server = _start_router(tmp_path, coordinator.url(), preset)
+    try:
+        _load_model(server, LOCAL_MODEL_ID)
+        _wait_for_entry(server, POOL_TEXT_MD)
+        coordinator.wait_for("handshake", lambda e: True)
+        coordinator.wait_for_sse()
+
+        # occupy the slot so the request intakes (uniform path)
+        t_long, _ = _occupy_slot(server, LOCAL_MODEL_ID)
+        try:
+            client: dict = {}
+
+            def _client() -> None:
+                r = requests.post(
+                    server.make_url("/v1/chat/completions"),
+                    json={
+                        "model": POOL_TEXT_MD,
+                        "stream": True,
+                        "max_tokens": 32,
+                        "messages": [{"role": "user", "content": "mid stream death"}],
+                    },
+                    stream=True,
+                    timeout=180,
+                )
+                client["status"] = r.status_code
+                client["lines"] = []
+                if r.status_code == 200:
+                    for line_bytes in r.iter_lines():
+                        line = line_bytes.decode("utf-8", "replace")
+                        if line:
+                            client["lines"].append(line)
+
+            t_client = threading.Thread(target=_client, daemon=True)
+            t_client.start()
+
+            intake = _wait_intake(coordinator)
+            job_id = intake["job_id"]
+
+            # arm the coordinator-side simulation: cut the relay mid-stream and
+            # mirror the terminal error (the running cap's behavior, D-G2)
+            coordinator.arm_mid_stream_death(job_id, message="service timeout after 2s (D-G2)")
+
+            t_long.join(timeout=180)
+            coordinator.send_work_offer(job_id, tag=POOL_TEXT_MD, est_ctx=256, est_prompt=32,
+                                        conv_key=intake["metadata"].get("conv_key"))
+
+            # the client stream must END (no hang, no half-open socket)
+            t_client.join(timeout=180)
+            assert not t_client.is_alive(), "the client stream hung (half-open socket)"
+            assert client["status"] == 200, client.get("status")
+            lines = client["lines"]
+            assert lines, "no lines at all"
+
+            # the stream started: content chunks before the terminal
+            body_lines = lines[:-3]
+            assert any('"delta"' in l for l in body_lines), lines[:5]
+
+            # the structured terminal: a network_error finish chunk, the
+            # coordinator's reason in an error object, and a final [DONE]
+            assert lines[-1] == "data: [DONE]", lines[-3:]
+            tail = "\n".join(lines[-3:])
+            assert "network_error" in tail, tail
+            assert "server_error" in tail, tail
+            assert "service timeout after 2s (D-G2)" in tail, tail
         finally:
             t_long.join(timeout=180)
     finally:

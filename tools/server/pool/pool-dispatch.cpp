@@ -450,8 +450,12 @@ struct server_http_pool_origin : server_http_res {
 };
 
 // feed the held-open response stream; emit the payload of each completed
-// "data:" line to the pipe, line terminated. heartbeats and blanks are dropped
-static bool sse_feed_response(const char * data, size_t len, std::string & buf, server_pipe<std::string> & pipe) {
+// "data:" line to the pipe, line terminated. heartbeats and blanks are dropped.
+// saw_done records the child's stream terminator ("data: [DONE]") - the
+// local signal that the served stream finished, for the client-facing
+// terminal (D-G2)
+static bool sse_feed_response(const char * data, size_t len, std::string & buf,
+                              server_pipe<std::string> & pipe, bool & saw_done) {
     buf.append(data, len);
     size_t start = 0;
     while (true) {
@@ -472,6 +476,9 @@ static bool sse_feed_response(const char * data, size_t len, std::string & buf, 
             payload.erase(0, 1);
         }
         payload += '\n'; // the client reads line oriented
+        if (payload == "data: [DONE]\n") {
+            saw_done = true;
+        }
         if (!pipe.write(std::move(payload))) {
             return false;
         }
@@ -483,6 +490,86 @@ static bool sse_feed_response(const char * data, size_t len, std::string & buf, 
 // a neutral error body, no request content
 static std::string pool_origin_error(const std::string & message) {
     return safe_json_to_str({{"error", {{"type", "server_error"}, {"message", message}}}});
+}
+
+// the terminal state of one origin job, filled by the bus handler (the
+// coordinator's terminal envelope, D-D6) and read by the relay thread for the
+// client-facing terminal (D-G2, WS-09)
+struct origin_terminal {
+    std::mutex mu;
+    bool have = false;
+    bool is_error = false;
+    std::string message; // the coordinator's reason, error case only (bounded)
+};
+
+// the client-facing terminal of an interrupted relay (D-G2, WS-09): the
+// response started and then ended without the child's [DONE] (the serving
+// member died mid-push and the coordinator's running cap cut the relay). The
+// client sees a clean, structured end-of-stream error - never a raw hang or a
+// half-open socket:
+//   stream: a finish_reason chunk (network_error) + an error chunk + [DONE]
+//   blob:   an error object (the whole body, or appended after partial bytes)
+// The finish_reason network_error is deliberate: stock pi maps it to an error
+// stop with a retryable message, and a retry is the only recovery for output
+// lost to an infrastructure failure (D-J5: client-retry only when retry is
+// actually desired)
+static void render_interrupted(server_pipe<std::string> & pipe, bool streaming, const std::string & reason) {
+    const json error_field = {{"type", "server_error"}, {"message", reason}};
+    if (streaming) {
+        const json finish_chunk = {
+            {"id", "chatcmpl-pool"},
+            {"object", "chat.completion.chunk"},
+            {"created", (uint64_t) 0},
+            {"model", "pool"},
+            {"choices", json::array({{{"index", 0}, {"delta", json::object()}, {"finish_reason", "network_error"}}})},
+            {"error", error_field},
+        };
+        const json error_chunk = {{"error", error_field}};
+        pipe.write("data: " + finish_chunk.dump() + "\n");
+        pipe.write("data: " + error_chunk.dump() + "\n");
+        pipe.write("data: [DONE]\n");
+    } else {
+        pipe.write("\n" + safe_json_to_str({{"error", error_field}}) + "\n");
+    }
+}
+
+// wait briefly for the coordinator's terminal envelope (it is mirrored just
+// before the relay closes; the bus delivery may lag the relay EOF by a moment)
+// and render the structured terminal unless the job completed
+static void render_interrupted_terminal(server_pipe<std::string> & pipe, bool streaming,
+                                        const std::shared_ptr<origin_terminal> & term) {
+    bool have = false;
+    bool is_error = false;
+    std::string message;
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+        while (true) {
+            std::lock_guard<std::mutex> lk(term->mu);
+            if (term->have || std::chrono::steady_clock::now() >= deadline) {
+                have = term->have;
+                is_error = term->is_error;
+                message = term->message;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+    // the coordinator says the job failed: render with its reason
+    if (is_error) {
+        if (!message.empty()) {
+            render_interrupted(pipe, streaming, "pool: " + message);
+        } else {
+            render_interrupted(pipe, streaming, "pool: response ended without completion");
+        }
+        return;
+    }
+    // the coordinator says the job completed: the stream stands as is. a
+    // stream with NO terminal event in time ended as an interruption; a blob
+    // stands as is (its body either parsed or it did not)
+    if (streaming && !have) {
+        render_interrupted(pipe, streaming,
+            "pool: response ended without completion (serving member may have failed)");
+    }
 }
 
 server_http_res_ptr pool_dispatch::origin_request(const std::string & tag, const std::string & raw_body,
@@ -524,8 +611,11 @@ server_http_res_ptr pool_dispatch::origin_request(const std::string & tag, const
     };
     auto intake_res = cli.Post("/pool/jobs", auth_headers, intake.dump(), "application/json");
     if (!intake_res || intake_res->status != 201) {
+        // D-J5 RETRY: the coordinator is unreachable or refused the submit -
+        // transient, a retry plausibly helps. 5xx + busy wording so stock pi's
+        // retry pattern matches even from the body alone
         res->status = 502;
-        res->data = pool_origin_error("pool intake failed");
+        res->data = pool_origin_error("pool intake failed (server_busy)");
         LOG_WRN("pool: intake failed: tag=%s status=%d\n", tag.c_str(), intake_res ? intake_res->status : 502);
         return res;
     }
@@ -538,7 +628,7 @@ server_http_res_ptr pool_dispatch::origin_request(const std::string & tag, const
     }
     if (job_id.empty()) {
         res->status = 502;
-        res->data = pool_origin_error("pool intake failed");
+        res->data = pool_origin_error("pool intake failed (server_busy)");
         return res;
     }
     LOG_INF("pool: intake ok: tag=%s job_id=%s est_prompt=%lld est_ctx=%lld\n",
@@ -547,8 +637,9 @@ server_http_res_ptr pool_dispatch::origin_request(const std::string & tag, const
     // 2. put the raw body verbatim (catalog 4)
     auto body_res = cli.Put("/pool/jobs/" + job_id + "/body", auth_headers, raw_body, "application/octet-stream");
     if (!body_res || body_res->status != 200) {
+        // D-J5 RETRY, as above
         res->status = 502;
-        res->data = pool_origin_error("pool body upload failed");
+        res->data = pool_origin_error("pool body upload failed (server_busy)");
         LOG_WRN("pool: body put failed: job_id=%s status=%d\n", job_id.c_str(), body_res ? body_res->status : 502);
         return res;
     }
@@ -558,6 +649,38 @@ server_http_res_ptr pool_dispatch::origin_request(const std::string & tag, const
     res->content_type = streaming ? "text/event-stream" : "application/json; charset=utf-8";
     res->headers["X-Accel-Buffering"] = "no";
 
+    // the terminal envelope of this job (completion / error, D-D6): the
+    // coordinator mirrors it on the subscribe stream just before closing the
+    // relay (D-G2). the bus handler only records it; the relay thread renders
+    // the client-facing terminal from it
+    auto term = std::make_shared<origin_terminal>();
+    const pool_event_bus::token_t term_token = pool_instance().bus().subscribe(
+        [term, job_id](const json & env) {
+            const std::string type = json_str(env, "type");
+            if (type != "completion" && type != "error") {
+                return;
+            }
+            if (!env.contains("payload") || !env["payload"].is_object()) {
+                return;
+            }
+            if (json_str(env["payload"], "job_id") != job_id) {
+                return;
+            }
+            std::lock_guard<std::mutex> lk(term->mu);
+            if (term->have) {
+                return;
+            }
+            term->have = true;
+            term->is_error = (type == "error");
+            if (term->is_error) {
+                std::string msg = json_str(env["payload"], "message");
+                if (msg.size() > 200) {
+                    msg = msg.substr(0, 200); // bound router/coordinator-supplied text
+                }
+                term->message = msg;
+            }
+        });
+
     auto pipe = res->pipe;
     auto cli2 = std::make_shared<httplib::Client>(cfg_.server);
     cli2->set_connection_timeout(CONNECT_TIMEOUT_S);
@@ -566,7 +689,7 @@ server_http_res_ptr pool_dispatch::origin_request(const std::string & tag, const
     res->cli = cli2;
     const std::string token = cfg_.token;
     const std::string router_id = cfg_.router_id;
-    res->thread = std::thread([pipe, job_id, cli2, token, router_id]() {
+    res->thread = std::thread([pipe, job_id, cli2, token, router_id, streaming, term, term_token]() {
         const httplib::Headers headers = {
             {"Authorization", "Bearer " + token},
             {"X-Pool-Proto", std::to_string(PROTO_VERSION)},
@@ -574,12 +697,21 @@ server_http_res_ptr pool_dispatch::origin_request(const std::string & tag, const
             {"Accept", "text/event-stream"},
         };
         std::string sse_buf;
+        bool saw_done = false;
         cli2->Get("/pool/jobs/" + job_id + "/response", headers,
                   [](const httplib::Response &) -> bool { return true; },
                   [&](const char * d, size_t len) -> bool {
-                      return sse_feed_response(d, len, sse_buf, *pipe);
+                      return sse_feed_response(d, len, sse_buf, *pipe, saw_done);
                   });
+        // the relay ended: a stream that never saw the child's [DONE] is an
+        // interruption (the serving member died mid-push) - render the clean,
+        // structured terminal before closing (D-G2, WS-09). a completed stream
+        // needs no terminal wait; a blob renders only on an error event
+        if (!streaming || !saw_done) {
+            render_interrupted_terminal(*pipe, streaming, term);
+        }
         pipe->close_write();
+        pool_instance().bus().unsubscribe(term_token);
     });
 
     res->next = [pipe](std::string & out) -> bool {
