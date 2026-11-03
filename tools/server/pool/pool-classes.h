@@ -76,4 +76,9 @@ private:
 // first 8192 bytes of the raw client payload. no parsing, no template transform
 std::string pool_conv_key(const std::string & raw_body);
 
+// D-G5: the intake request id, a deterministic UUID derived from the FULL raw
+// request body (SHA-256, first 16 bytes, 8-4-4-4-12 lowercase). same body ->
+// same id; different body -> different id
+std::string pool_request_id(const std::string & raw_body);
+
 }

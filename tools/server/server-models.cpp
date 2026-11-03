@@ -2613,6 +2613,13 @@ void server_models_routes::init_routes() {
             res_err(res, format_error_response("model is not found", ERROR_TYPE_NOT_FOUND));
             return res;
         }
+        // an excluded pool member: the load is an unmark, not a real load
+        // (D-F1). the model is already loaded, so no re-load
+        if (pool_dispatch->is_excluded(meta->name)) {
+            pool_dispatch->unmark_excluded(meta->name);
+            res_ok(res, {{"success", true}});
+            return res;
+        }
         if (meta->is_running()) {
             res_err(res, format_error_response("model is already running", ERROR_TYPE_INVALID_REQUEST));
             return res;
@@ -2638,8 +2645,15 @@ void server_models_routes::init_routes() {
             if (meta.hidden) {
                 continue; // cache model deduplicated by a preset
             }
+            // an excluded pool member reports "excluded" instead of "loaded"
+            // (D-F1): pi's listing gate accepts only loaded/sleeping, so the
+            // member becomes non-selectable for the owner
+            std::string status_value = server_model_status_to_string(meta.status);
+            if (status_value == "loaded" && pool_dispatch->is_excluded(meta.name)) {
+                status_value = "excluded";
+            }
             json status {
-                {"value",  server_model_status_to_string(meta.status)},
+                {"value",  status_value},
                 {"args",   meta.args},
             };
             if (!meta.preset.name.empty()) {
@@ -2780,7 +2794,28 @@ void server_models_routes::init_routes() {
         std::string name = json_value(body, "model", std::string());
         auto model = models.get_meta(name);
         if (!model.has_value()) {
+            // a pool class tag is a virtual entry, not a real model: the owner
+            // marks the member model, not the class (D-F1)
+            if (name.rfind("pool-", 0) == 0) {
+                res_err(res, format_error_response("a class tag has no real model to unload; mark the member model instead", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
             res_err(res, format_error_response("model is not found", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        // a loaded pool member: the unload is an owner exclusion mark, not a
+        // real unload (D-F1). the model stays loaded; the coordinator avoids it
+        // for this owner's class requests
+        bool has_pool_tag = false;
+        for (const auto & tag : model->tags) {
+            if (tag.rfind("pool-", 0) == 0) {
+                has_pool_tag = true;
+                break;
+            }
+        }
+        if (model->is_running() && has_pool_tag) {
+            pool_dispatch->mark_excluded(model->name);
+            res_ok(res, {{"success", true}});
             return res;
         }
         if (!model->is_running() && model->status != SERVER_MODEL_STATUS_DOWNLOADING) {

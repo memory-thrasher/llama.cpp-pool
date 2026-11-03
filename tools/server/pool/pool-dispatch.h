@@ -8,6 +8,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 
 using json = common_json;
@@ -49,6 +50,17 @@ public:
     server_http_res_ptr origin_request(const std::string & tag, const std::string & raw_body,
                                        int64_t est_prompt_tokens, int64_t est_ctx_needed);
 
+    // exclusion marks (D-F1): the owner's /models/unload on a pool member is a
+    // mark in this router's local state, not a real unload. the mark lives in
+    // router memory (a router is single-user); the coordinator DB is the
+    // dispatch authority
+    bool is_excluded(const std::string & model_name) const;
+    // record the mark and post exclusion_update(excluded=true); the local mark
+    // is applied even when the event send fails (it is logged)
+    void mark_excluded(const std::string & model_name);
+    // clear the mark and post exclusion_update(excluded=false)
+    void unmark_excluded(const std::string & model_name);
+
 private:
     // serving side, runs on the bus thread
     void on_envelope(const json & env);
@@ -73,6 +85,9 @@ private:
     server_models & models_;
     pool_classes & classes_;
     uint64_t bus_token_ = 0;
+
+    mutable std::mutex excl_mutex_;
+    std::set<std::string> excl_models_;
 };
 
 } // namespace pool

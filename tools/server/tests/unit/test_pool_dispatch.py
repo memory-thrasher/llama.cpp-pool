@@ -13,6 +13,7 @@ Scenarios:
   E anti-memory: the prompt never reaches the router log
 """
 
+import hashlib
 import itertools
 import json
 import os
@@ -892,5 +893,139 @@ def test_dispatch_mid_stream_death(tmp_path, coordinator):
             assert "service timeout after 2s (D-G2)" in tail, tail
         finally:
             t_long.join(timeout=180)
+    finally:
+        server.stop()
+
+
+#
+# WS-12: exclusion marks (D-F1) + intake idempotency (D-G5)
+#
+
+
+def _expected_request_id(raw_body: bytes) -> str:
+    """the D-G5 request id: sha-256 of the full body, first 16 bytes,
+    8-4-4-4-12 lowercase. the reference the fork must match"""
+    h = hashlib.sha256(raw_body).hexdigest()
+    return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
+
+
+def _intake_request_id(server: ServerProcess, coordinator: "FakeCoordinator", raw_body: bytes) -> str:
+    """occupy the slot (so the local member cannot serve the pool request), POST
+    the pool request with the exact raw body (it intakes on the coordinator), and
+    return the request_id the fork stamped. the client is not awaited: the intake
+    is all the test needs, the held-open response simply times out. each call
+    occupies the slot fresh so the fake-timing occupation cannot run out mid-test"""
+    t_long, _ = _occupy_slot(server, LOCAL_MODEL_ID)
+    try:
+        n = coordinator.intake_count()
+
+        def _client() -> None:
+            requests.post(
+                server.make_url("/v1/chat/completions"),
+                data=raw_body,
+                headers={"Content-Type": "application/json"},
+                stream=True,
+                timeout=15,
+            )
+
+        t = threading.Thread(target=_client, daemon=True)
+        t.start()
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            with coordinator.lock:
+                if len(coordinator.intakes) > n:
+                    return coordinator.intakes[-1]["metadata"].get("request_id", "")
+            time.sleep(0.1)
+        raise AssertionError("timed out waiting for the intake")
+    finally:
+        t_long.join(timeout=180)
+
+
+def test_request_id_determinism(tmp_path, coordinator):
+    """D-G5: the intake request_id is the sha-256 of the full raw body (first 16
+    bytes, uuid-shaped). same body -> same id; different body -> different id"""
+    preset = str(tmp_path / "preset.ini")
+    _write_preset(preset, LOCAL_MODEL_ID, POOL_TEXT_MD)
+    server = _start_router(tmp_path, coordinator.url(), preset)
+    try:
+        _load_model(server, LOCAL_MODEL_ID)
+        _wait_for_entry(server, POOL_TEXT_MD)
+        coordinator.wait_for("handshake", lambda e: True)
+        coordinator.wait_for_sse()
+
+        body_a = b'{"model":"pool-text-md","messages":[{"role":"user","content":"REQ-A-WS12"}]}'
+        body_b = b'{"model":"pool-text-md","messages":[{"role":"user","content":"REQ-B-WS12"}]}'
+
+        rid_a1 = _intake_request_id(server, coordinator, body_a)
+        rid_a2 = _intake_request_id(server, coordinator, body_a)
+        rid_b = _intake_request_id(server, coordinator, body_b)
+
+        assert rid_a1, "no request_id stamped on the intake"
+        # same body -> same id
+        assert rid_a1 == rid_a2, f"same body gave different ids: {rid_a1} vs {rid_a2}"
+        # different body -> different id
+        assert rid_a1 != rid_b, "different bodies gave the same id"
+        # the id is the sha-256 of the body (first 16 bytes, uuid-shaped)
+        assert rid_a1 == _expected_request_id(body_a), rid_a1
+        assert rid_b == _expected_request_id(body_b), rid_b
+    finally:
+        server.stop()
+
+
+def test_exclusion_mark_flow(tmp_path, coordinator):
+    """D-F1: /models/unload on a loaded pool member is an exclusion mark, not a
+    real unload (the coordinator gets exclusion_update(excluded=true), the model
+    stays loaded, /models reports "excluded"). /models/load on the excluded
+    member unmarks it (exclusion_update(excluded=false), no reload, status back
+    to loaded)"""
+    preset = str(tmp_path / "preset.ini")
+    _write_preset(preset, LOCAL_MODEL_ID, POOL_TEXT_MD)
+    server = _start_router(tmp_path, coordinator.url(), preset)
+    try:
+        _load_model(server, LOCAL_MODEL_ID)
+        _wait_for_entry(server, LOCAL_MODEL_ID)
+        router_id = coordinator.wait_for("handshake", lambda e: True)["payload"]["router_id"]
+
+        # unload the pool member: it is marked excluded, not really unloaded
+        res = server.make_request("POST", "/models/unload", data={"model": LOCAL_MODEL_ID})
+        assert res.status_code == 200, res.body
+        assert res.body.get("success") is True
+        excl_on = coordinator.wait_for("exclusion_update", lambda e:
+            e["payload"]["model_id"] == LOCAL_MODEL_ID and e["payload"]["excluded"] is True)
+        assert excl_on["payload"]["router_id"] == router_id
+        # the model stays loaded and now reports "excluded"
+        _wait_model_status(server, LOCAL_MODEL_ID, "excluded")
+
+        # load the excluded member: it is unmarked, not re-loaded
+        res = server.make_request("POST", "/models/load", data={"model": LOCAL_MODEL_ID})
+        assert res.status_code == 200, res.body
+        assert res.body.get("success") is True
+        excl_off = coordinator.wait_for("exclusion_update", lambda e:
+            e["payload"]["model_id"] == LOCAL_MODEL_ID and e["payload"]["excluded"] is False)
+        assert excl_off["payload"]["router_id"] == router_id
+        # back to loaded (the model was never unloaded, so no real reload ran)
+        _wait_model_status(server, LOCAL_MODEL_ID, "loaded")
+    finally:
+        server.stop()
+
+
+def test_unload_plain_model_real_unload(tmp_path, coordinator):
+    """D-F1: /models/unload on a real model WITHOUT a pool tag is a real unload
+    (the existing router behavior, unchanged). the model goes away, no exclusion
+    event is sent"""
+    preset = str(tmp_path / "preset.ini")
+    # a plain model: no pool- tag
+    _write_preset(preset, "plain-md", None)
+    server = _start_router(tmp_path, coordinator.url(), preset)
+    try:
+        _load_model(server, "plain-md")
+        coordinator.wait_for("handshake", lambda e: True)
+
+        res = server.make_request("POST", "/models/unload", data={"model": "plain-md"})
+        assert res.status_code == 200, res.body
+        assert res.body.get("success") is True
+        # the model is really unloaded, and no exclusion event was sent
+        _wait_model_status(server, "plain-md", "unloaded")
+        assert coordinator.received_of("exclusion_update") == [], "no exclusion event for a plain model"
     finally:
         server.stop()

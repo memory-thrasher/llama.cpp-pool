@@ -264,6 +264,37 @@ void pool_dispatch::post_event(const std::string & type, const json & payload) c
     }
 }
 
+bool pool_dispatch::is_excluded(const std::string & model_name) const {
+    std::lock_guard<std::mutex> lk(excl_mutex_);
+    return excl_models_.count(model_name) > 0;
+}
+
+void pool_dispatch::mark_excluded(const std::string & model_name) {
+    {
+        std::lock_guard<std::mutex> lk(excl_mutex_);
+        excl_models_.insert(model_name);
+    }
+    post_event("exclusion_update", {
+        {"router_id", cfg_.router_id},
+        {"model_id", model_name},
+        {"excluded", true},
+    });
+    LOG_INF("pool: excluded model %s (owner mark, D-F1)\n", model_name.c_str());
+}
+
+void pool_dispatch::unmark_excluded(const std::string & model_name) {
+    {
+        std::lock_guard<std::mutex> lk(excl_mutex_);
+        excl_models_.erase(model_name);
+    }
+    post_event("exclusion_update", {
+        {"router_id", cfg_.router_id},
+        {"model_id", model_name},
+        {"excluded", false},
+    });
+    LOG_INF("pool: unexcluded model %s (owner mark cleared, D-F1)\n", model_name.c_str());
+}
+
 // phase 2 of the dispatch: download the raw client payload (catalog 5)
 std::string pool_dispatch::pull_body(const std::string & job_id) const {
     httplib::Client cli(cfg_.server);
@@ -591,7 +622,7 @@ server_http_res_ptr pool_dispatch::origin_request(const std::string & tag, const
 
     // 1. intake the metadata (catalog 4)
     const json intake = {
-        {"request_id", new_uuid()},
+        {"request_id", pool_request_id(raw_body)}, // D-G5: deterministic prompt hash
         {"tag", tag},
         {"est_prompt_tokens", (uint64_t) est_prompt_tokens},
         {"est_ctx_needed", (uint64_t) est_ctx_needed},
@@ -610,7 +641,9 @@ server_http_res_ptr pool_dispatch::origin_request(const std::string & tag, const
         {"Content-Type", "application/json"},
     };
     auto intake_res = cli.Post("/pool/jobs", auth_headers, intake.dump(), "application/json");
-    if (!intake_res || intake_res->status != 201) {
+    // 201 is a fresh job, 200 is a D-G5 dedupe (the existing job is returned);
+    // anything else is a refusal
+    if (!intake_res || (intake_res->status != 201 && intake_res->status != 200)) {
         // D-J5 RETRY: the coordinator is unreachable or refused the submit -
         // transient, a retry plausibly helps. 5xx + busy wording so stock pi's
         // retry pattern matches even from the body alone
@@ -636,11 +669,29 @@ server_http_res_ptr pool_dispatch::origin_request(const std::string & tag, const
 
     // 2. put the raw body verbatim (catalog 4)
     auto body_res = cli.Put("/pool/jobs/" + job_id + "/body", auth_headers, raw_body, "application/octet-stream");
-    if (!body_res || body_res->status != 200) {
+    if (!body_res) {
         // D-J5 RETRY, as above
         res->status = 502;
         res->data = pool_origin_error("pool body upload failed (server_busy)");
         LOG_WRN("pool: body put failed: job_id=%s status=%d\n", job_id.c_str(), body_res ? body_res->status : 502);
+        return res;
+    }
+    if (body_res->status == 409) {
+        // D-G5: the existing job is already running/completed, so the body is
+        // refused. this is a duplicate retry, not a transient failure: a
+        // structured 409 to the client, no retry
+        res->status = 409;
+        res->content_type = "application/json";
+        res->data = safe_json_to_str({{"error", {{"type", "duplicate_request"},
+            {"message", "duplicate request already accepted"}}}});
+        LOG_INF("pool: duplicate intake: tag=%s job_id=%s (already accepted)\n", tag.c_str(), job_id.c_str());
+        return res;
+    }
+    if (body_res->status != 200) {
+        // D-J5 RETRY, as above
+        res->status = 502;
+        res->data = pool_origin_error("pool body upload failed (server_busy)");
+        LOG_WRN("pool: body put failed: job_id=%s status=%d\n", job_id.c_str(), body_res->status);
         return res;
     }
 

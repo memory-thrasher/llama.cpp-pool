@@ -34,6 +34,17 @@ std::string pool_conv_key(const std::string & raw_body) {
     return hash_sha256_hex(raw_body.data(), n);
 }
 
+std::string pool_request_id(const std::string & raw_body) {
+    const std::string hex = hash_sha256_hex(raw_body.data(), raw_body.size());
+    if (hex.size() < 32) {
+        return hex; // a truncated digest, should not happen
+    }
+    // the first 16 bytes (32 hex chars), formatted 8-4-4-4-12 lowercase to
+    // match the schema uuid pattern. no version-bit fiddling (D-G5)
+    return hex.substr(0, 8) + "-" + hex.substr(8, 4) + "-" + hex.substr(12, 4) +
+           "-" + hex.substr(16, 4) + "-" + hex.substr(20, 12);
+}
+
 pool_classes::pool_classes(const pool_config & cfg, std::function<std::vector<pool_local_member>()> local_members)
         : cfg_(cfg), local_members_(std::move(local_members)), ttl_ms_(DEFAULT_TTL_MS) {
     const std::string ttl = common_get_env("LLAMA_POOL_ADVERT_TTL_MS");
