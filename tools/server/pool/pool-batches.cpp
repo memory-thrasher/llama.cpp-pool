@@ -105,24 +105,36 @@ bool read_file(const std::string & path, std::string & out) {
     return true;
 }
 
+// now, unix ms; -1 is impossible (both clocks are realtime)
+int64_t now_unix_ms() {
+#ifdef _WIN32
+    __int64 t = 0;
+    _time64(&t);
+    return (int64_t) t * 1000;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t) ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+#endif
+}
+
 // the file age in ms; -1 when the mtime is unreadable. stat directly -
 // std::filesystem::last_write_time is not system_clock based on this
 // toolchain and its age math is wrong (it swept fresh batches at once)
 int64_t file_age_ms(const std::string & path) {
 #ifdef _WIN32
-    (void) path;
-    return -1; // no sweep on an unreadable age: the TTL just never fires
+    struct _stat64 st;
+    if (_stat64(path.c_str(), &st) != 0) {
+        return -1;
+    }
 #else
     struct stat st;
     if (::stat(path.c_str(), &st) != 0) {
         return -1;
     }
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    const int64_t now_ms = (int64_t) ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-    const int64_t mtime_ms = (int64_t) st.st_mtim.tv_sec * 1000 + st.st_mtim.tv_nsec / 1000000;
-    return now_ms - mtime_ms;
 #endif
+    const int64_t mtime_ms = (int64_t) st.st_mtim.tv_sec * 1000 + st.st_mtim.tv_nsec / 1000000;
+    return now_unix_ms() - mtime_ms;
 }
 
 // the neutral error body (no request content)
@@ -481,9 +493,10 @@ void pool_batches::capture_job(const std::string & batch_id, const std::string &
              });
 
     // the relay ended: the terminal of the job. ok = no structured error
-    // chunk, and the child's [DONE] on a stream (a blob has no [DONE]); a
-    // mid-stream coordinator terminal is an error chunk, already accounted
-    const bool ok = !saw_error && (!streaming || saw_done);
+    // chunk, a positive terminal (bytes pushed - a coordinator-side terminal,
+    // expiry or restart, closes the relay with no lines at all), and the
+    // child's [DONE] on a stream (a blob has no [DONE])
+    const bool ok = !saw_error && bytes > 0 && (!streaming || saw_done);
     if (ndjson) {
         ndjson.flush();
     }
@@ -511,12 +524,24 @@ void pool_batches::maybe_sweep() {
             break;
         }
         const std::string name = entry.path().filename().string();
-        // a batch file is <uuid>.json (41 chars); the per-job metas are swept with it
-        if (name.size() != 41 || name.substr(36) != ".json" || !is_uuid_shape(name.substr(0, 36))) {
+        // a batch file is <uuid>.json (41 chars); the per-job files are
+        // <uuid>.ndjson / <uuid>.meta.json
+        if (name.size() != 41 || !is_uuid_shape(name.substr(0, 36))) {
+            continue;
+        }
+        const std::string suffix = name.substr(36);
+        if (suffix != ".json" && suffix != ".ndjson" && suffix != ".meta.json") {
             continue;
         }
         const int64_t age = file_age_ms(entry.path().string());
         if (age < 0 || age <= ttl_ms_) {
+            continue;
+        }
+        if (suffix != ".json") {
+            // an orphaned per-job file (its batch is already swept, or the
+            // capture outlived the batch sweep): remove it on its own
+            std::filesystem::remove(entry.path(), ec);
+            removed++;
             continue;
         }
         const std::string batch_id = name.substr(0, 36);

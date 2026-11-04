@@ -1121,6 +1121,16 @@ def _batch_job(content: str, marker: str = "") -> dict:
     }
 
 
+def _blob_batch_job(content: str) -> dict:
+    # non-streaming: the child's response is one blob line, no [DONE]
+    return {
+        "model": POOL_TEXT_MD,
+        "stream": False,
+        "max_tokens": 16,
+        "messages": [{"role": "user", "content": content}],
+    }
+
+
 def _submit_batch(server: ServerProcess, class_name: str, jobs: list[dict]) -> tuple[int, dict]:
     res = server.make_request("POST", "/pool/batches", data={"class": class_name, "jobs": jobs})
     return res.status_code, res.body
@@ -1347,5 +1357,57 @@ def test_batch_retention_ttl(tmp_path, coordinator):
         assert not (batch_dir / (batch_id + ".json")).exists()
         assert not (batch_dir / (job_id + ".ndjson")).exists()
         assert not (batch_dir / (job_id + ".meta.json")).exists()
+    finally:
+        server.stop()
+
+
+def test_batch_failed_job_ok_flag(tmp_path, coordinator):
+    """the capture's ok flag (review F1): a served non-streaming job is
+    ok=true; a job whose relay is closed with NO lines at all - a
+    coordinator-side terminal (expiry, restart) pushes nothing on the relay,
+    its error goes to the subscribe stream - is done/ok=false, never
+    ok=true with an empty response"""
+    preset = str(tmp_path / "preset.ini")
+    _write_preset(preset, LOCAL_MODEL_ID, POOL_TEXT_MD)
+    batch_dir = tmp_path / "batches"
+    os.environ["POOL_BATCH_DIR"] = str(batch_dir)
+    server = _start_router(tmp_path, coordinator.url(), preset)
+    try:
+        coordinator.wait_for("handshake", lambda e: True)
+        coordinator.wait_for_sse()
+
+        status, body = _submit_batch(server, POOL_TEXT_MD, [
+            _blob_batch_job("served blob job"),
+            _blob_batch_job("failed blob job"),
+        ])
+        assert status == 202, (status, body)
+        batch_id = body["batch_id"]
+        job_ids = body["job_ids"]
+        assert len(job_ids) == 2
+
+        deadline = time.time() + 60
+        while time.time() < deadline and coordinator.intake_count() < 2:
+            time.sleep(0.1)
+        assert coordinator.intake_count() >= 2, coordinator.intakes
+        # the capture threads have PUT the bodies and hold their relays open
+        time.sleep(1.5)
+
+        blob = json.dumps({"choices": [{"message": {"role": "assistant", "content": "WS10-BLOB-OK"}}]})
+        # job 1: served - the child's blob response, one line
+        coordinator._serve_job(job_ids[0], [blob])
+        # job 2: the relay closes with no lines (F1's case)
+        coordinator._serve_job(job_ids[1], [])
+
+        body = _wait_batch_done(server, batch_id)
+        jobs = _jobs_of(body)
+        served, failed = jobs[job_ids[0]], jobs[job_ids[1]]
+        assert served["status"] == "done", served
+        assert served["ok"] is True, served
+        assert "WS10-BLOB-OK" in served["response"], served
+        assert failed["status"] == "done", failed
+        assert failed["ok"] is False, failed
+        assert failed["response"] == "", failed
+        # the ok flag on disk matches the poll
+        assert json.loads((batch_dir / (job_ids[1] + ".meta.json")).read_text())["ok"] is False
     finally:
         server.stop()
