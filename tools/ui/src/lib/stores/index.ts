@@ -43,6 +43,9 @@ export { modelsStore } from './models/index.svelte';
 // MODELS DISCOVER (HuggingFace browse state for the discover dialog)
 export { modelsDiscoverStore } from './models-discover/index.svelte';
 
+// POOL (local pool state of this router, WS-16)
+export { poolStore } from './pool.svelte';
+
 // SERVER
 export { serverStore } from './server.svelte';
 

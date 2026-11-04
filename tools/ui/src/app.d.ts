@@ -27,6 +27,8 @@ import type {
 	ApiModelsSseEvent,
 	ApiModelsSseProgress,
 	ApiModelsUnloadResponse,
+	ApiPoolClassEntry,
+	ApiPoolStatusResponse,
 	ApiProcessingState,
 	ChatAttachmentDisplayItem,
 	// Chat types
@@ -92,6 +94,8 @@ declare global {
 		ApiModelsDownloadRequest,
 		ApiModelsDownloadResponse,
 		ApiModelsUnloadResponse,
+		ApiPoolClassEntry,
+		ApiPoolStatusResponse,
 		ApiProcessingState,
 		// Chat types
 		ChatAttachmentDisplayItem,

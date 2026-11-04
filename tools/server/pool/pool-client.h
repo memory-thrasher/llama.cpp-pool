@@ -54,6 +54,12 @@ public:
     // fire and forget: queue a fresh capacity snapshot. safe from any thread, no-op when not running
     void on_capacity_change();
 
+    // the subscribe link (SSE stream or held long-poll) to the coordinator is
+    // open right now; false when the pool is off or between failed rounds
+    bool link_open() const;
+    // milliseconds since the last subscribe event or heartbeat; 0 when never in contact
+    uint64_t ms_since_last_contact() const;
+
     pool_event_bus & bus() { return bus_; }
 
     // the running config (router_id, name, token); null when the pool is off

@@ -58,6 +58,11 @@ std::string json_str(const json & obj, const char * key) {
     return "";
 }
 
+uint64_t now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 } // namespace
 
 //
@@ -102,6 +107,25 @@ struct pool_client::state {
     std::thread sender_thread;
     std::atomic<bool> running{false};
     std::atomic<bool> stopping{false};
+
+    // link state for GET /pool/status (WS-16): link is true while a subscribe
+    // round (SSE stream or held long-poll) is in flight; last_contact is the
+    // steady-clock ms of the newest inbound event or heartbeat (0 = never)
+    std::atomic<bool> link{false};
+    std::atomic<uint64_t> last_contact{0};
+
+    void note_contact() {
+        last_contact.store(now_ms());
+    }
+
+    uint64_t ms_since_last_contact() const {
+        const uint64_t last = last_contact.load();
+        if (last == 0) {
+            return 0;
+        }
+        const uint64_t now = now_ms();
+        return now > last ? now - last : 0;
+    }
 
     struct event_t {
         std::string type;
@@ -297,11 +321,14 @@ struct pool_client::state {
                     return false;
                 }
                 connected = true;
+                link = true;
+                note_contact();
                 return true;
             },
             [&buf, &data, this](const char * d, size_t len) -> bool {
                 return sse_feed(d, len, buf, data);
             });
+        link = false;
         const auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - t0).count();
 
         {
@@ -353,6 +380,7 @@ struct pool_client::state {
                 }
             } else if (line[0] == ':') {
                 // comment; the coordinator sends ": hb <unix_ms>" heartbeats
+                note_contact();
             } else if (line.rfind("data:", 0) == 0) {
                 std::string payload = line.substr(5);
                 if (!payload.empty() && payload[0] == ' ') {
@@ -380,6 +408,7 @@ struct pool_client::state {
         if (!env.is_object()) {
             return;
         }
+        note_contact();
         bus->post(env);
     }
 
@@ -394,7 +423,9 @@ struct pool_client::state {
             {"X-Pool-Proto", std::to_string(PROTO_VERSION)},
             {"X-Pool-Router-Id", cfg.router_id}, // e2e fix: see sse_round
         };
+        link = true; // the held long-poll is the subscribe link in this mode
         auto res = cli.Get("/pool/subscribe", headers);
+        link = false;
         if (!res) {
             LOG_WRN("pool: long-poll failed: cannot reach %s\n", cfg.server.c_str());
             return false;
@@ -403,6 +434,7 @@ struct pool_client::state {
             LOG_WRN("pool: long-poll failed: status=%d\n", res->status);
             return false;
         }
+        note_contact(); // a successful round is the contact in this mode
         json offers;
         try {
             offers = json::parse(res->body);
@@ -511,6 +543,14 @@ void pool_client::on_capacity_change() {
     if (st) {
         st->on_capacity_change();
     }
+}
+
+bool pool_client::link_open() const {
+    return st ? st->link.load() : false;
+}
+
+uint64_t pool_client::ms_since_last_contact() const {
+    return st ? st->ms_since_last_contact() : 0;
 }
 
 const pool_config * pool_client::config() const {

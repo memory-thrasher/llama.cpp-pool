@@ -148,6 +148,28 @@ export { ConversationTransferService } from './conversation-transfer.service';
 export { ModelsService } from './models.service';
 
 /**
+ * **PoolService** - Local pool state communication
+ *
+ * Stateless HTTP client for the router's own pool state: GET /pool/status
+ * (WS-16). The response is the pinned local view — coordinator link state,
+ * the class advertisement and the serving/originating counters. Counts, tags
+ * and ids only (anti-memory): the UI never lists member names or content from
+ * it, and the pool-wide sharing policy stays on the coordinator portal
+ * (cookie auth, a different origin).
+ *
+ * **Architecture & Relationships:**
+ * - **PoolService**: Stateless protocol communication (this class)
+ * - **poolStore**: Reactive layer owning the status snapshot and its refresh
+ * - **PoolStatusPanel**: The consumer that renders the snapshot
+ *
+ * **Endpoints:**
+ * - `GET /pool/status` — the local pool state of this router (ROUTER mode only)
+ *
+ * @see poolStore in stores/pool.svelte.ts — the reactive consumer
+ */
+export { PoolService } from './pool.service';
+
+/**
  * **HuggingFaceService** - Hugging Face Hub browsing and searching
  *
  * Stateless HTTP client for the HF REST API (`/api/models`, `/tree`, raw

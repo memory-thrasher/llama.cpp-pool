@@ -2950,6 +2950,14 @@ void server_models_routes::init_routes() {
         return res;
     };
 
+    // read-only: no request content is read or kept
+    this->get_router_pool_status = [this](const server_http_req &) {
+        auto res = std::make_unique<server_http_res>();
+        res->status = 200;
+        res->data = safe_json_to_str(this->pool_status());
+        return res;
+    };
+
     this->router_stream_get = [this](const server_http_req & req) {
         // GET /v1/stream?conv_id=<id>&from=N. resolve the owning child from the conv_id -> model
         // map, 404 when nothing maps
@@ -3092,6 +3100,44 @@ void server_models_routes::init_routes() {
     };
 }
 
+// the pinned body of GET /pool/status (WS-16): the local pool state of this
+// router. counts, tags and ids only - no model names beyond the tag, no
+// bodies, no response content (anti-memory). always 200: pool=false answers
+// the router that has no coordinator, so the UI needs no 404 handling
+json server_models_routes::pool_status() {
+    const bool configured = pool_cfg_.enabled();
+
+    json classes = json::array();
+    if (configured) {
+        // the merged advertisement: the coordinator numbers when it lists the
+        // tag, the local-only numbers in its absence (D-C8)
+        for (const auto & [tag, ad] : pool_classes->get()) {
+            classes.push_back({
+                {"tag", tag},
+                {"member_count", (uint64_t) ad.member_count},
+            });
+        }
+    }
+
+    const pool::pool_client & client = pool::pool_instance();
+    const pool::pool_dispatch & dispatch = *pool_dispatch;
+    return json {
+        {"pool", configured},
+        {"router_id", configured ? pool_cfg_.router_id : std::string()},
+        {"connected", configured && client.link_open()},
+        {"last_contact_ms", configured ? client.ms_since_last_contact() : (uint64_t) 0},
+        {"classes", std::move(classes)},
+        {"serving", {
+            {"pending", dispatch.serving_pending()},
+            {"served_total", dispatch.served_total()},
+            {"tokens_served_total", dispatch.tokens_served_total()},
+        }},
+        {"originating", {
+            {"pending", dispatch.originating_pending()},
+            {"total", dispatch.originating_total()},
+        }},
+    };
+}
 
 
 //

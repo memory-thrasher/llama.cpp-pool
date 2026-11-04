@@ -50,6 +50,15 @@ public:
     server_http_res_ptr origin_request(const std::string & tag, const std::string & raw_body,
                                        int64_t est_prompt_tokens, int64_t est_ctx_needed);
 
+    // GET /pool/status (WS-16): the local counters, counts only (anti-memory).
+    // serving: this router as a serving member; originating: this router as a
+    // job submitter with the response relay held open
+    uint64_t serving_pending() const;
+    uint64_t served_total() const;
+    uint64_t tokens_served_total() const;
+    uint64_t originating_pending() const;
+    uint64_t originating_total() const;
+
     // exclusion marks (D-F1): the owner's /models/unload on a pool member is a
     // mark in this router's local state, not a real unload. the mark lives in
     // router memory (a router is single-user); the coordinator DB is the
@@ -88,6 +97,14 @@ private:
 
     mutable std::mutex excl_mutex_;
     std::set<std::string> excl_models_;
+
+    // the GET /pool/status counters (WS-16): incremented at accept/intake,
+    // decremented at the terminal; cumulative totals since process start
+    std::atomic<uint64_t> serving_pending_{0};
+    std::atomic<uint64_t> served_total_{0};
+    std::atomic<uint64_t> tokens_served_total_{0};
+    std::atomic<uint64_t> origin_pending_{0};
+    std::atomic<uint64_t> origin_total_{0};
 };
 
 } // namespace pool

@@ -507,6 +507,45 @@ export interface ApiModelsUnloadResponse {
 }
 
 /**
+ * One class as advertised by this router, from GET /pool/status (WS-16).
+ * The merged advertisement: the coordinator's numbers when it lists the tag,
+ * the local-only numbers in its absence. Tags only - no member names.
+ */
+export interface ApiPoolClassEntry {
+	tag: string;
+	member_count: number;
+}
+
+/**
+ * The local pool state of this router from GET /pool/status (WS-16).
+ * Counts, tags and ids only (anti-memory): no model names beyond the class
+ * tag, no bodies, no response content. The pool-wide sharing policy lives on
+ * the coordinator portal, a different origin with cookie auth.
+ */
+export interface ApiPoolStatusResponse {
+	/** False on a router without a coordinator; the UI then shows "pool not configured". */
+	pool: boolean;
+	/** This router's stable id; empty when the pool is off. */
+	router_id: string;
+	/** The subscribe link to the coordinator is open. */
+	connected: boolean;
+	/** Milliseconds since the last subscribe event or heartbeat; 0 when never in contact. */
+	last_contact_ms: number;
+	classes: ApiPoolClassEntry[];
+	/** This router as a serving member. */
+	serving: {
+		pending: number;
+		served_total: number;
+		tokens_served_total: number;
+	};
+	/** This router as a job submitter with the response relay held open. */
+	originating: {
+		pending: number;
+		total: number;
+	};
+}
+
+/**
  * Entry returned by POST /v1/streams/lookup. The client passes the conv ids it owns in the body
  * and the server returns one entry per matching live or recently completed background streaming
  * session, keyed by conversation_id. The WebUI uses this at mount and on visibilitychange to

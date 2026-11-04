@@ -48,6 +48,20 @@ int64_t json_int(const json & o, const char * key, int64_t fallback) {
     return fallback;
 }
 
+// holds one slot of the serving-pending count (WS-16) for its scope: a job is
+// in flight from accept until its terminal, whichever path serve_job takes
+struct serving_pending_guard {
+    std::atomic<uint64_t> & pending;
+
+    explicit serving_pending_guard(std::atomic<uint64_t> & p) : pending(p) {
+        pending.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    ~serving_pending_guard() {
+        pending.fetch_sub(1, std::memory_order_relaxed);
+    }
+};
+
 // set the top-level "model" to the local model id and clamp max_tokens to the
 // member's remaining context (D-C6). a body that does not parse is a failure
 std::string rewrite_pool_body(const std::string & body, const std::string & model_id,
@@ -86,49 +100,49 @@ void parse_usage(const std::string & response, int64_t & prompt_tokens, int64_t 
     size_t start = 0;
     while (true) {
         const size_t nl = response.find('\n', start);
-        std::string line = nl == std::string::npos ? response.substr(start) : response.substr(start, nl - start);
-        if (nl == std::string::npos) {
+        const bool last = nl == std::string::npos;
+        std::string line = last ? response.substr(start) : response.substr(start, nl - start);
+        if (!last) {
+            start = nl + 1;
+        }
+        if (!line.empty()) {
+            // a streamed line is "data: <json>"; strip the prefix before parsing
+            if (line.rfind("data:", 0) == 0) {
+                line = line.substr(5);
+                if (!line.empty() && line[0] == ' ') {
+                    line.erase(0, 1);
+                }
+            }
+            if (line != "[DONE]") {
+                json obj;
+                try {
+                    obj = json::parse(line);
+                } catch (const std::exception &) {
+                    obj = json();
+                }
+                if (obj.is_object()) {
+                    // the standard OpenAI usage block
+                    if (obj.contains("usage") && obj["usage"].is_object()) {
+                        prompt_tokens     = json_int(obj["usage"], "prompt_tokens", prompt_tokens);
+                        completion_tokens = json_int(obj["usage"], "completion_tokens", completion_tokens);
+                    }
+                    // llama.cpp streams a timings block in place of usage
+                    if (obj.contains("timings") && obj["timings"].is_object()) {
+                        prompt_tokens     = json_int(obj["timings"], "prompt_n", prompt_tokens);
+                        completion_tokens = json_int(obj["timings"], "predicted_n", completion_tokens);
+                    }
+                    if (obj.contains("choices") && obj["choices"].is_array() && !obj["choices"].empty()
+                            && obj["choices"][0].is_object()) {
+                        const json & c0 = obj["choices"][0];
+                        if (c0.contains("finish_reason") && c0["finish_reason"].is_string() && !c0["finish_reason"].empty()) {
+                            stop_reason = c0["finish_reason"].get<std::string>();
+                        }
+                    }
+                }
+            }
+        }
+        if (last) {
             break;
-        }
-        start = nl + 1;
-        if (line.empty()) {
-            continue;
-        }
-        // a streamed line is "data: <json>"; strip the prefix before parsing
-        if (line.rfind("data:", 0) == 0) {
-            line = line.substr(5);
-            if (!line.empty() && line[0] == ' ') {
-                line.erase(0, 1);
-            }
-        }
-        if (line == "[DONE]") {
-            continue;
-        }
-        json obj;
-        try {
-            obj = json::parse(line);
-        } catch (const std::exception &) {
-            continue;
-        }
-        if (!obj.is_object()) {
-            continue;
-        }
-        // the standard OpenAI usage block
-        if (obj.contains("usage") && obj["usage"].is_object()) {
-            prompt_tokens     = json_int(obj["usage"], "prompt_tokens", prompt_tokens);
-            completion_tokens = json_int(obj["usage"], "completion_tokens", completion_tokens);
-        }
-        // llama.cpp streams a timings block in place of usage
-        if (obj.contains("timings") && obj["timings"].is_object()) {
-            prompt_tokens     = json_int(obj["timings"], "prompt_n", prompt_tokens);
-            completion_tokens = json_int(obj["timings"], "predicted_n", completion_tokens);
-        }
-        if (obj.contains("choices") && obj["choices"].is_array() && !obj["choices"].empty()
-                && obj["choices"][0].is_object()) {
-            const json & c0 = obj["choices"][0];
-            if (c0.contains("finish_reason") && c0["finish_reason"].is_string() && !c0["finish_reason"].empty()) {
-                stop_reason = c0["finish_reason"].get<std::string>();
-            }
         }
     }
 }
@@ -396,6 +410,10 @@ void pool_dispatch::post_completion(pool_job_state & job, const std::string & re
     int64_t completion_tokens = 0;
     std::string stop_reason;
     parse_usage(response, prompt_tokens, completion_tokens, stop_reason);
+    // the serving counters of GET /pool/status: one job served, plus its
+    // completion tokens (anti-memory: counts only)
+    served_total_.fetch_add(1, std::memory_order_relaxed);
+    tokens_served_total_.fetch_add((uint64_t) completion_tokens, std::memory_order_relaxed);
     post_event("completion", {
         {"job_id", job.job_id},
         {"ok", true},
@@ -415,6 +433,7 @@ void pool_dispatch::post_completion(pool_job_state & job, const std::string & re
 void pool_dispatch::serve_job(std::string job_id, std::string tag, std::string model_id,
                               std::string conv_key, int64_t est_prompt_tokens, int64_t est_ctx_needed,
                               uint64_t member_ctx) {
+    const serving_pending_guard pending(serving_pending_);
     pool_job_state job;
     job.job_id   = job_id;
     job.tag      = tag;
@@ -666,6 +685,9 @@ server_http_res_ptr pool_dispatch::origin_request(const std::string & tag, const
     }
     LOG_INF("pool: intake ok: tag=%s job_id=%s est_prompt=%lld est_ctx=%lld\n",
             tag.c_str(), job_id.c_str(), (long long) est_prompt_tokens, (long long) est_ctx_needed);
+    // one more intake since process start (WS-16); the pending counter moves
+    // when the relay below is held open, and back at its close
+    origin_total_.fetch_add(1, std::memory_order_relaxed);
 
     // 2. put the raw body verbatim (catalog 4)
     auto body_res = cli.Put("/pool/jobs/" + job_id + "/body", auth_headers, raw_body, "application/octet-stream");
@@ -699,6 +721,7 @@ server_http_res_ptr pool_dispatch::origin_request(const std::string & tag, const
     res->status = 200;
     res->content_type = streaming ? "text/event-stream" : "application/json; charset=utf-8";
     res->headers["X-Accel-Buffering"] = "no";
+    origin_pending_.fetch_add(1, std::memory_order_relaxed);
 
     // the terminal envelope of this job (completion / error, D-D6): the
     // coordinator mirrors it on the subscribe stream just before closing the
@@ -740,7 +763,7 @@ server_http_res_ptr pool_dispatch::origin_request(const std::string & tag, const
     res->cli = cli2;
     const std::string token = cfg_.token;
     const std::string router_id = cfg_.router_id;
-    res->thread = std::thread([pipe, job_id, cli2, token, router_id, streaming, term, term_token]() {
+    res->thread = std::thread([this, pipe, job_id, cli2, token, router_id, streaming, term, term_token]() {
         const httplib::Headers headers = {
             {"Authorization", "Bearer " + token},
             {"X-Pool-Proto", std::to_string(PROTO_VERSION)},
@@ -763,6 +786,8 @@ server_http_res_ptr pool_dispatch::origin_request(const std::string & tag, const
         }
         pipe->close_write();
         pool_instance().bus().unsubscribe(term_token);
+        // the relay is closed: the intake no longer counts as pending (WS-16)
+        origin_pending_.fetch_sub(1, std::memory_order_relaxed);
     });
 
     res->next = [pipe](std::string & out) -> bool {
@@ -774,6 +799,26 @@ server_http_res_ptr pool_dispatch::origin_request(const std::string & tag, const
         return has_next;
     };
     return res;
+}
+
+uint64_t pool_dispatch::serving_pending() const {
+    return serving_pending_.load(std::memory_order_relaxed);
+}
+
+uint64_t pool_dispatch::served_total() const {
+    return served_total_.load(std::memory_order_relaxed);
+}
+
+uint64_t pool_dispatch::tokens_served_total() const {
+    return tokens_served_total_.load(std::memory_order_relaxed);
+}
+
+uint64_t pool_dispatch::originating_pending() const {
+    return origin_pending_.load(std::memory_order_relaxed);
+}
+
+uint64_t pool_dispatch::originating_total() const {
+    return origin_total_.load(std::memory_order_relaxed);
 }
 
 } // namespace pool

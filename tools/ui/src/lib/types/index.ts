@@ -31,6 +31,8 @@ export type {
 	ApiModelsLoadResponse,
 	ApiModelsListResponse,
 	ApiModelsUnloadResponse,
+	ApiPoolClassEntry,
+	ApiPoolStatusResponse,
 	AudioInputFormat,
 	ApiStreamSession
 } from './api';

@@ -17,6 +17,8 @@ export enum ServerModelStatus {
 	DOWNLOAD_FINISHED = 'download_finished',
 	DOWNLOADED = 'downloaded',
 	DOWNLOADING = 'downloading',
+	/** A loaded pool member the owner marked out of the pool (D-F1); the model stays loaded. */
+	EXCLUDED = 'excluded',
 	FAILED = 'failed',
 	/** A download that never finished: listed by the server without an instance, resumable. */
 	INCOMPLETE = 'incomplete',

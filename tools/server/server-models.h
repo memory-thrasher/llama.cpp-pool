@@ -461,6 +461,9 @@ struct server_models_routes {
     // async batch (D-H1): submit + poll
     server_http_context::handler_t post_router_pool_batches;
     server_http_context::handler_t get_router_pool_batches;
+    // the local pool state of this router (WS-16): counts, tags and ids only
+    server_http_context::handler_t get_router_pool_status;
+    json pool_status();
     // management API
     server_http_context::handler_t get_router_models_sse;
     server_http_context::handler_t post_router_models;

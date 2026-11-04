@@ -289,6 +289,7 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
         ctx_http.del ("/models",               ex_wrapper(models_routes->del_router_models));
         ctx_http.post("/pool/batches",         ex_wrapper(models_routes->post_router_pool_batches));
         ctx_http.get ("/pool/batches/:batch_id", ex_wrapper(models_routes->get_router_pool_batches));
+        ctx_http.get ("/pool/status",          ex_wrapper(models_routes->get_router_pool_status));
     }
 
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)

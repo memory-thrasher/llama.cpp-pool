@@ -8,6 +8,12 @@ export const API_MODELS = {
 	UNLOAD: '/models/unload'
 };
 
+// the local pool state of this router (WS-16). the pool-wide sharing policy
+// stays on the coordinator portal, a different origin with cookie auth
+export const API_POOL = {
+	STATUS: '/pool/status'
+};
+
 // chat completion routes, the control route drives realtime inference (e.g. end reasoning)
 export const API_CHAT = {
 	COMPLETIONS: './v1/chat/completions',
