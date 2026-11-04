@@ -55,6 +55,8 @@ add_library(${TARGET}
     pool/pool-classes.h
     pool/pool-dispatch.cpp
     pool/pool-dispatch.h
+    pool/pool-batches.cpp
+    pool/pool-batches.h
 )
 set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 

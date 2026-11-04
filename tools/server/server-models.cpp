@@ -2920,6 +2920,36 @@ void server_models_routes::init_routes() {
         return res;
     };
 
+    // async batch (D-H1): the client submits jobs and polls for the results;
+    // it is gone after submit, the capture runs detached (pool-batches.cpp)
+    this->post_router_pool_batches = [this](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const std::exception &) {
+            res_err(res, format_error_response("the request body must be a JSON object", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (!body.is_object()) {
+            res_err(res, format_error_response("the request body must be a JSON object", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        json out;
+        res->status = pool_batches->submit(body, out);
+        res->data = safe_json_to_str(out);
+        return res;
+    };
+
+    this->get_router_pool_batches = [this](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        const std::string batch_id = req.get_param("batch_id");
+        json out;
+        res->status = pool_batches->poll(batch_id, out);
+        res->data = safe_json_to_str(out);
+        return res;
+    };
+
     this->router_stream_get = [this](const server_http_req & req) {
         // GET /v1/stream?conv_id=<id>&from=N. resolve the owning child from the conv_id -> model
         // map, 404 when nothing maps

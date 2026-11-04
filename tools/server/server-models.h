@@ -9,6 +9,7 @@
 
 #include "pool/pool-classes.h"
 #include "pool/pool-dispatch.h"
+#include "pool/pool-batches.h"
 
 #include <mutex>
 #include <condition_variable>
@@ -425,6 +426,7 @@ struct server_models_routes {
     server_models models;
     std::unique_ptr<pool::pool_classes> pool_classes;
     std::unique_ptr<pool::pool_dispatch> pool_dispatch;
+    std::unique_ptr<pool::pool_batches> pool_batches;
     pool::pool_config pool_cfg_;
     server_models_routes(const common_params & params, int argc, char ** argv, const pool::pool_config & pool_cfg)
             : params(params), models(params, argc, argv), pool_cfg_(pool_cfg) {
@@ -442,6 +444,7 @@ struct server_models_routes {
             return models.pool_local_members();
         });
         pool_dispatch = std::make_unique<pool::pool_dispatch>(pool_cfg, models, *pool_classes);
+        pool_batches = std::make_unique<pool::pool_batches>(pool_cfg, *pool_classes);
         init_routes();
     }
 
@@ -455,6 +458,9 @@ struct server_models_routes {
     server_http_context::handler_t get_router_models;
     server_http_context::handler_t post_router_models_load;
     server_http_context::handler_t post_router_models_unload;
+    // async batch (D-H1): submit + poll
+    server_http_context::handler_t post_router_pool_batches;
+    server_http_context::handler_t get_router_pool_batches;
     // management API
     server_http_context::handler_t get_router_models_sse;
     server_http_context::handler_t post_router_models;

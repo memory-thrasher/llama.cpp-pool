@@ -57,6 +57,16 @@ def _free_port() -> int:
     return port
 
 
+# the lines a fake serving router pushes for an auto-served batch job: the
+# child's stream lines verbatim (data-framed, ending in data: [DONE])
+CANNED_BATCH_PUSH = [
+    'data: {"id":"chatcmpl-batch","object":"chat.completion.chunk","created":1,"model":"tiny","choices":[{"index":0,"delta":{"role":"assistant","content":"WS10-"},"finish_reason":null}]}',
+    'data: {"id":"chatcmpl-batch","object":"chat.completion.chunk","created":1,"model":"tiny","choices":[{"index":0,"delta":{"content":"BATCH"},"finish_reason":null}]}',
+    'data: {"id":"chatcmpl-batch","object":"chat.completion.chunk","created":1,"model":"tiny","choices":[{"index":0,"delta":{"content":" OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":4}}',
+    'data: [DONE]',
+]
+
+
 class _Job:
     def __init__(self, job_id: str):
         self.job_id = job_id
@@ -84,6 +94,15 @@ class FakeCoordinator:
         # cut mid-stream (the serving member died) and the terminal error is
         # mirrored, exactly as the coordinator's running cap does (D-G2)
         self.mid_stream_death: dict[str, dict] = {}
+        # WS-10 batch: intake dedupe (the D-G5 request_id) + auto-serve. when
+        # auto_serve is on, the pushed lines of a staged job are HELD until
+        # release_batch_jobs(), so a test can observe the pending status first
+        self.request_ids: dict[str, str] = {}
+        self.auto_serve = False
+        self.held_lines: dict[str, list[str]] = {}
+        # set once the test releases; a staged job whose PUT lands after the
+        # release must not be held (lost-wakeup), so it is served directly
+        self.release_event = threading.Event()
         self._next_job = itertools.count(1)
         self._httpd = ThreadingHTTPServer(("127.0.0.1", self.port), self._make_handler())
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
@@ -161,6 +180,26 @@ class FakeCoordinator:
             time.sleep(0.05)
         raise AssertionError("timed out waiting for the router SSE subscription")
 
+    def _serve_job(self, job_id: str, lines: list[str]) -> None:
+        with self.lock:
+            job = self.jobs.get(job_id)
+        if job is None:
+            return
+        for line in lines:
+            job.resp_queue.put(line)
+        job.resp_queue.put(None)
+
+    def release_batch_jobs(self) -> None:
+        """the fake serving side serves the held batch jobs: push the canned
+        stream lines (as the serving router would) so the held-open relay
+        closes"""
+        with self.lock:
+            self.release_event.set()
+            held = dict(self.held_lines)
+            self.held_lines = {}
+        for job_id, lines in held.items():
+            self._serve_job(job_id, lines)
+
     def stop(self) -> None:
         self._httpd.shutdown()
         self._httpd.server_close()
@@ -227,6 +266,22 @@ class FakeCoordinator:
     def _intake(self, h: "Handler") -> None:
         length = int(h.headers.get("Content-Length", 0))
         meta = json.loads(h.rfile.read(length) or b"{}")
+        # the D-G5 idempotency: the same (user, request_id) within the window
+        # returns the existing job (200); the window is not modeled here
+        request_id = meta.get("request_id", "")
+        with self.lock:
+            existing = self.request_ids.get(request_id) if request_id else None
+        if existing is not None:
+            with self.lock:
+                job_id = existing
+                self.intakes.append({"job_id": job_id, "metadata": meta, "origin": h.headers.get("X-Pool-Router-Id", "")})
+            h.send_response(200)
+            h.send_header("Content-Type", "application/json")
+            body = json.dumps({"job_id": job_id}).encode()
+            h.send_header("Content-Length", str(len(body)))
+            h.end_headers()
+            h.wfile.write(body)
+            return
         job_id = f"job-{next(self._next_job)}"
         job = _Job(job_id)
         job.tag = meta.get("tag", "")
@@ -234,6 +289,8 @@ class FakeCoordinator:
         job.origin_router = h.headers.get("X-Pool-Router-Id", "")
         with self.lock:
             self.jobs[job_id] = job
+            if request_id:
+                self.request_ids[request_id] = job_id
             self.intakes.append({"job_id": job_id, "metadata": meta, "origin": job.origin_router})
         h.send_response(201)
         h.send_header("Content-Type", "application/json")
@@ -245,12 +302,25 @@ class FakeCoordinator:
     def _put_body(self, h: "Handler", job_id: str) -> None:
         length = int(h.headers.get("Content-Length", 0))
         data = h.rfile.read(length)
+        serve_now = False
         with self.lock:
             job = self.jobs.get(job_id)
             if job is None:
                 h._send_json({"error": "unknown job"}, 404)
                 return
             job.body = data
+            if self.auto_serve:
+                if self.release_event.is_set():
+                    # the test released before this PUT landed: serve directly,
+                    # never hold (a held job would wait for a release that
+                    # already went by)
+                    serve_now = True
+                else:
+                    # the fake serving side will serve this job: hold the canned
+                    # lines until the test releases them
+                    self.held_lines[job_id] = list(CANNED_BATCH_PUSH)
+        if serve_now:
+            self._serve_job(job_id, list(CANNED_BATCH_PUSH))
         h._send_json({"status": "queued"})
 
     def _get_body(self, h: "Handler", job_id: str) -> None:
@@ -364,7 +434,10 @@ class FakeCoordinator:
 
 @pytest.fixture(autouse=True)
 def _restore_env():
-    saved = {k: os.environ.get(k) for k in ("LLAMA_POOL_TOKEN", "LLAMA_POOL_LINK_MODE")}
+    saved = {
+        k: os.environ.get(k)
+        for k in ("LLAMA_POOL_TOKEN", "LLAMA_POOL_LINK_MODE", "POOL_BATCH_DIR", "POOL_BATCH_RESULT_TTL_MS")
+    }
     yield
     for k, v in saved.items():
         if v is None:
@@ -1027,5 +1100,252 @@ def test_unload_plain_model_real_unload(tmp_path, coordinator):
         # the model is really unloaded, and no exclusion event was sent
         _wait_model_status(server, "plain-md", "unloaded")
         assert coordinator.received_of("exclusion_update") == [], "no exclusion event for a plain model"
+    finally:
+        server.stop()
+
+
+#
+# WS-10: async batch (D-H1) - submit, detached capture, poll
+#
+
+
+BATCH_MARKER = "YAK-MARKER-ABC-12345"
+
+
+def _batch_job(content: str, marker: str = "") -> dict:
+    return {
+        "model": POOL_TEXT_MD,
+        "stream": True,
+        "max_tokens": 16,
+        "messages": [{"role": "user", "content": (marker + content) if marker else content}],
+    }
+
+
+def _submit_batch(server: ServerProcess, class_name: str, jobs: list[dict]) -> tuple[int, dict]:
+    res = server.make_request("POST", "/pool/batches", data={"class": class_name, "jobs": jobs})
+    return res.status_code, res.body
+
+
+def _poll_batch(server: ServerProcess, batch_id: str) -> tuple[int, dict]:
+    res = server.make_request("GET", f"/pool/batches/{batch_id}")
+    return res.status_code, res.body
+
+
+def _jobs_of(body: dict) -> dict[str, dict]:
+    return {j["job_id"]: j for j in body.get("jobs", [])}
+
+
+def _wait_batch_done(server: ServerProcess, batch_id: str, timeout: float = 60.0) -> dict:
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        status, body = _poll_batch(server, batch_id)
+        assert status == 200, (status, body)
+        last = body
+        jobs = _jobs_of(body)
+        if all(j["status"] != "pending" for j in jobs.values()):
+            return body
+        time.sleep(0.2)
+    raise AssertionError(f"timed out waiting for batch {batch_id} to finish; last: {json.dumps(last)[:2000]}")
+
+
+def test_batch_submit_poll_roundtrip(tmp_path, coordinator):
+    """submit -> 202 with ids; the detached capture runs without any client
+    socket; the poll goes pending -> done with the captured stream, ok=true.
+    the intake is priority=batch on the class; the prompt never reaches the
+    router log (anti-memory)"""
+    preset = str(tmp_path / "preset.ini")
+    _write_preset(preset, LOCAL_MODEL_ID, POOL_TEXT_MD)
+    batch_dir = tmp_path / "batches"
+    os.environ["POOL_BATCH_DIR"] = str(batch_dir)
+    coordinator.auto_serve = True
+    server = _start_router(tmp_path, coordinator.url(), preset)
+    try:
+        coordinator.wait_for("handshake", lambda e: True)
+        coordinator.wait_for_sse()
+
+        status, body = _submit_batch(server, POOL_TEXT_MD, [
+            _batch_job("first job", BATCH_MARKER),
+            _batch_job("second job"),
+        ])
+        assert status == 202, (status, body)
+        batch_id = body["batch_id"]
+        assert len(batch_id) == 36
+        job_ids = body["job_ids"]
+        assert len(job_ids) == 2
+        assert all(job_ids) and len(set(job_ids)) == 2  # the ids are the coordinator's (uuids in prod)
+
+        # the batch record on disk (the fork's data dir)
+        with open(batch_dir / (batch_id + ".json")) as f:
+            record = json.load(f)
+        assert record["class"] == POOL_TEXT_MD
+        assert record["job_ids"] == job_ids
+        assert "created_at" in record
+
+        # the intakes: priority batch, the class tag, the deterministic id
+        deadline = time.time() + 60
+        while time.time() < deadline and coordinator.intake_count() < 2:
+            time.sleep(0.1)
+        assert coordinator.intake_count() >= 2, coordinator.intakes
+        with coordinator.lock:
+            meta_a = coordinator.jobs[job_ids[0]].metadata
+            meta_b = coordinator.jobs[job_ids[1]].metadata
+        assert meta_a["priority"] == "batch"
+        assert meta_b["priority"] == "batch"
+        assert meta_a["tag"] == POOL_TEXT_MD
+        # the fork re-dumps the job object compactly (insertion order) before
+        # the sha-256; mirror the exact bytes here
+        expected_rid = _expected_request_id(json.dumps(
+            _batch_job("first job", BATCH_MARKER), separators=(",", ":")).encode())
+        assert meta_a["request_id"] == expected_rid, (meta_a["request_id"], expected_rid)
+
+        # the capture is not released yet: the poll reports pending
+        time.sleep(1.0)
+        status, body = _poll_batch(server, batch_id)
+        assert status == 200, (status, body)
+        assert body["batch_id"] == batch_id
+        assert body["class"] == POOL_TEXT_MD
+        jobs = _jobs_of(body)
+        assert all(j["status"] == "pending" for j in jobs.values()), jobs
+        assert all("response" not in j for j in jobs.values()), jobs
+
+        # the fake serving side serves the jobs; the capture closes
+        coordinator.release_batch_jobs()
+        body = _wait_batch_done(server, batch_id)
+        jobs = _jobs_of(body)
+        for jid in job_ids:
+            j = jobs[jid]
+            assert j["status"] == "done", j
+            assert j["ok"] is True, j
+            # the captured stream: the child's lines verbatim, [DONE] included.
+            # the fake splits the marker across chunks; reassembling the deltas
+            # must give the full text (the capture is line-for-line, not a re-parse)
+            resp = j["response"]
+            assert "data: [DONE]" in resp, resp
+            content = "".join(
+                json.loads(line[len("data: "):])["choices"][0]["delta"].get("content", "")
+                for line in resp.splitlines()
+                if line.startswith("data: ") and line != "data: [DONE]"
+            )
+            assert content == "WS10-BATCH OK", content
+            # the capture files on disk
+            ndjson = (batch_dir / (jid + ".ndjson")).read_text()
+            assert ndjson == j["response"], "poll response differs from the capture file"
+            meta = json.loads((batch_dir / (jid + ".meta.json")).read_text())
+            assert meta["ok"] is True
+            assert "done_at" in meta
+
+        # anti-memory: the prompt content never reaches the router log
+        with open(server.log_path, "r", errors="replace") as f:
+            log = f.read()
+        assert BATCH_MARKER not in log, "the batch prompt marker leaked into the router log"
+        # job ids and counts may (metadata)
+        assert batch_id in log or job_ids[0] in log
+    finally:
+        server.stop()
+
+
+def test_batch_duplicate_intake(tmp_path, coordinator):
+    """a job whose intake dedupes (D-G5, same body) is recorded as status
+    "duplicate" in the batch metadata - no second capture"""
+    preset = str(tmp_path / "preset.ini")
+    _write_preset(preset, LOCAL_MODEL_ID, POOL_TEXT_MD)
+    coordinator.auto_serve = True
+    server = _start_router(tmp_path, coordinator.url(), preset)
+    try:
+        coordinator.wait_for("handshake", lambda e: True)
+        coordinator.wait_for_sse()
+
+        job = _batch_job("duplicate me")
+
+        status, body = _submit_batch(server, POOL_TEXT_MD, [job])
+        assert status == 202, (status, body)
+        first_id = body["job_ids"][0]
+        coordinator.release_batch_jobs()
+        body = _wait_batch_done(server, body["batch_id"])
+        assert _jobs_of(body)[first_id]["status"] == "done"
+
+        # the same body again: the intake dedupes onto the first job
+        status, body = _submit_batch(server, POOL_TEXT_MD, [job])
+        assert status == 202, (status, body)
+        assert body["job_ids"] == [first_id], (body["job_ids"], first_id)
+        status, body = _poll_batch(server, body["batch_id"])
+        assert status == 200, (status, body)
+        j = _jobs_of(body)[first_id]
+        assert j["status"] == "duplicate", j
+        assert j["ok"] is None
+        assert "response" not in j, j
+    finally:
+        server.stop()
+
+
+def test_batch_validation(tmp_path, coordinator):
+    """class must exist, jobs must be a non-empty array of JSON objects,
+    capped at 50"""
+    preset = str(tmp_path / "preset.ini")
+    _write_preset(preset, LOCAL_MODEL_ID, POOL_TEXT_MD)
+    server = _start_router(tmp_path, coordinator.url(), preset)
+    try:
+        coordinator.wait_for("handshake", lambda e: True)
+
+        # an unknown class
+        status, body = _submit_batch(server, "pool-no-such-class", [_batch_job("x")])
+        assert status == 400, (status, body)
+        assert "class not found" in json.dumps(body), body
+
+        # empty jobs
+        status, body = _submit_batch(server, POOL_TEXT_MD, [])
+        assert status == 400, (status, body)
+
+        # a non-object job
+        status, body = _submit_batch(server, POOL_TEXT_MD, ["not an object"])
+        assert status == 400, (status, body)
+
+        # over the cap
+        status, body = _submit_batch(server, POOL_TEXT_MD, [_batch_job(f"j{i}") for i in range(51)])
+        assert status == 400, (status, body)
+        assert "max" in json.dumps(body), body
+    finally:
+        server.stop()
+
+
+def test_batch_retention_ttl(tmp_path, coordinator):
+    """POOL_BATCH_RESULT_TTL_MS: a batch older than the TTL is swept (the
+    housekeeping tick, triggered by the next poll); the poll then 404s"""
+    preset = str(tmp_path / "preset.ini")
+    _write_preset(preset, LOCAL_MODEL_ID, POOL_TEXT_MD)
+    batch_dir = tmp_path / "batches"
+    os.environ["POOL_BATCH_DIR"] = str(batch_dir)
+    # the sweep is throttled to once per second after the last sweep, so the
+    # TTL must sit well above that; 2s leaves the detached capture (which
+    # starts right after the submit) ample room to finish before expiry
+    os.environ["POOL_BATCH_RESULT_TTL_MS"] = "2000"
+    coordinator.auto_serve = True
+    server = _start_router(tmp_path, coordinator.url(), preset)
+    try:
+        coordinator.wait_for("handshake", lambda e: True)
+
+        status, body = _submit_batch(server, POOL_TEXT_MD, [_batch_job("ttl job")])
+        assert status == 202, (status, body)
+        batch_id = body["batch_id"]
+        job_id = body["job_ids"][0]
+        coordinator.release_batch_jobs()
+        body = _wait_batch_done(server, batch_id)
+        assert all(j["status"] == "done" for j in _jobs_of(body).values())
+        assert (batch_dir / (batch_id + ".json")).exists()
+
+        # past the TTL: poll until the sweep has removed the batch
+        deadline = time.time() + 30
+        removed = False
+        while time.time() < deadline:
+            status, _ = _poll_batch(server, batch_id)
+            if status == 404:
+                removed = True
+                break
+            time.sleep(0.5)
+        assert removed, "the batch was not swept after the TTL"
+        assert not (batch_dir / (batch_id + ".json")).exists()
+        assert not (batch_dir / (job_id + ".ndjson")).exists()
+        assert not (batch_dir / (job_id + ".meta.json")).exists()
     finally:
         server.stop()
