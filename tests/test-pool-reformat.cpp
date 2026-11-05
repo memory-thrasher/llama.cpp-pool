@@ -319,8 +319,9 @@ static const std::vector<tmpl_entry> TEMPLATES = {
 
 struct case_entry { const char * id; const char * messages; };
 // the corpus: plain multi-turn; assistant tool_call + role:tool result;
-// reasoning_content present; image content part (typed text parts standing in
-// for the image slot); and a mix of the above
+// reasoning_content present; typed text content parts (the engine's content
+// part types are text/media_marker; an image_url part is not one - the
+// pipeline test pins what the reformat does with it); and a mix of the above
 static const std::vector<case_entry> CORPUS = {
     {"plain-multi-turn",
      R"MSG([
@@ -343,7 +344,7 @@ static const std::vector<case_entry> CORPUS = {
         {"role": "user", "content": "Solve 2 + 2 and show your working."},
         {"role": "assistant", "content": "The answer is 4.", "reasoning_content": "Let me think. Two plus two is four."}
      ])MSG"},
-    {"image-content-part",
+    {"text-content-parts",
      R"MSG([
         {"role": "user", "content": [
             {"type": "text", "text": "Describe this image: "},
@@ -455,6 +456,18 @@ void test_pipeline_skip_and_reformat(testing & t) {
     // the a->b->a identity holds for the re-serialized list
     std::vector<common_chat_msg> kept = common_chat_msgs_parse_oaicompat(out["messages"]);
     t.assert_true("cross-template a->b->a identity", pool::pool_roundtrip_ok(kept));
+
+    // an image_url content part is not an engine part type: the engine's
+    // parse throws, so the cross-template reformat hard-fails (the job
+    // terminals reformat_failed; the child never gets an unrenderable part).
+    // the SAME-template skip is unaffected: the body passes byte-identical
+    // and the serving child serves it as-is
+    const std::string image_body =
+        R"({"model":"pool-md","stream":false,"messages":[{"role":"user","content":[{"type":"text","text":"what is this?"},{"type":"image_url","image_url":{"url":"https://example.com/cat.png"}}]}]})";
+    const std::string img_cross = pool::pool_reformat_body(image_body, h, h_other, TPL_MISTRAL);
+    t.assert_true("cross-template image_url hard-fails (documented limitation)", img_cross.empty());
+    const std::string img_same = pool::pool_reformat_body(image_body, h, h, TPL_QWEN3);
+    t.assert_true("same-template image_url is the byte-identical skip", img_same == image_body);
 }
 
 // the reasoning keep heuristic result per corpus template (design note)

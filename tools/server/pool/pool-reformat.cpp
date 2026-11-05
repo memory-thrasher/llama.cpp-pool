@@ -82,15 +82,15 @@ bool pool_roundtrip_ok(const std::vector<common_chat_msg> & canonical_in) {
     common_json serialized;
     try {
         serialized = common_chat_msgs_to_json_oaicompat(canonical_in);
-    } catch (const std::exception & e) {
-        LOG_ERR("pool reformat: round trip serialize failed: %s\n", e.what());
+    } catch (const std::exception &) {
+        LOG_ERR("pool reformat: round trip serialize failed\n");
         return false;
     }
     std::vector<common_chat_msg> reparsed;
     try {
         reparsed = common_chat_msgs_parse_oaicompat(serialized);
-    } catch (const std::exception & e) {
-        LOG_ERR("pool reformat: round trip re-parse failed: %s\n", e.what());
+    } catch (const std::exception &) {
+        LOG_ERR("pool reformat: round trip re-parse failed\n");
         return false;
     }
     if (reparsed.size() != canonical_in.size()) {
@@ -117,11 +117,14 @@ std::string pool_reformat_body(const std::string & body,
         return body;
     }
 
+    // the exception text of these parses can embed a fragment of the body
+    // (engine throws carry part.dump()), so the logs below are fixed strings
+    // only (anti-memory)
     common_json obj;
     try {
         obj = common_json::parse(body);
-    } catch (const std::exception & e) {
-        LOG_ERR("pool reformat: body does not parse: %s\n", e.what());
+    } catch (const std::exception &) {
+        LOG_ERR("pool reformat: body does not parse\n");
         return "";
     }
     if (!obj.is_object() || !obj.contains("messages") || !obj["messages"].is_array()) {
@@ -132,8 +135,8 @@ std::string pool_reformat_body(const std::string & body,
     std::vector<common_chat_msg> canonical;
     try {
         canonical = common_chat_msgs_parse_oaicompat(obj["messages"]);
-    } catch (const std::exception & e) {
-        LOG_ERR("pool reformat: message parse failed: %s\n", e.what());
+    } catch (const std::exception &) {
+        LOG_ERR("pool reformat: message parse failed\n");
         return "";
     }
 
@@ -155,8 +158,8 @@ std::string pool_reformat_body(const std::string & body,
     common_json messages;
     try {
         messages = common_chat_msgs_to_json_oaicompat(canonical);
-    } catch (const std::exception & e) {
-        LOG_ERR("pool reformat: message serialize failed: %s\n", e.what());
+    } catch (const std::exception &) {
+        LOG_ERR("pool reformat: message serialize failed\n");
         return "";
     }
     obj["messages"] = messages;
