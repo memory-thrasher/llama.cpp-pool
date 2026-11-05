@@ -193,6 +193,13 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-server-component.cpp)
     target_include_directories(test-server-component PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-server-component PRIVATE server-context)
+
+    # WS-17: cross-template chat reformat corpus (D-M1/D-M2). links the pool
+    # reformat code from llama-server-impl; the corpus needs no model/GGUF
+    llama_build_and_test(test-pool-reformat.cpp)
+    target_include_directories(test-pool-reformat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-pool-reformat PRIVATE llama-server-impl)
+
     llama_build_and_test(test-json-schema-to-grammar.cpp)
 
     if (NOT GGML_BACKEND_DL)

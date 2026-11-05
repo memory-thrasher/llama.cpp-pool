@@ -2,6 +2,7 @@
 
 #include "pool-client.h"
 #include "pool-classes.h"
+#include "pool-reformat.h"
 #include "server-models.h"
 #include "common.h"
 #include "log.h"
@@ -179,6 +180,8 @@ void pool_dispatch::handle_work_offer(const json & payload) {
     const std::string job_id = json_str(payload, "job_id");
     const std::string tag    = json_str(payload, "tag");
     const std::string conv_key = json_str(payload, "conv_key");
+    // the origin's template identity (WS-17); "" when the offer predates the field
+    const std::string origin_template_hash = json_str(payload, "origin_template_hash");
     const int64_t est_prompt  = json_int(payload, "est_prompt_tokens", 0);
     const int64_t est_ctx     = json_int(payload, "est_ctx_needed", 0);
     if (job_id.empty() || tag.empty()) {
@@ -208,7 +211,7 @@ void pool_dispatch::handle_work_offer(const json & payload) {
         {"n_ctx", (uint64_t) member_ctx},
     });
 
-    serve_job(job_id, tag, member, conv_key, est_prompt, est_ctx, member_ctx);
+    serve_job(job_id, tag, member, conv_key, est_prompt, est_ctx, member_ctx, origin_template_hash);
 }
 
 // a loaded member with the tag and a free slot, most headroom over the
@@ -433,7 +436,7 @@ void pool_dispatch::post_completion(pool_job_state & job, const std::string & re
 
 void pool_dispatch::serve_job(std::string job_id, std::string tag, std::string model_id,
                               std::string conv_key, int64_t est_prompt_tokens, int64_t est_ctx_needed,
-                              uint64_t member_ctx) {
+                              uint64_t member_ctx, std::string origin_template_hash) {
     const pending_guard pending(serving_pending_);
     pool_job_state job;
     job.job_id   = job_id;
@@ -457,9 +460,21 @@ void pool_dispatch::serve_job(std::string job_id, std::string tag, std::string m
         return;
     }
 
+    // WS-17: cross-template reformat (D-M1/D-M2). same template (or the origin
+    // had no local member) is a byte-identical skip; a different template
+    // re-serializes the messages under the serving template. "" is a terminal
+    // pre_token reformat_failed - the body is never served malformed
+    const std::string serving_hash = models_.pool_member_template_hash(job.model_id);
+    const std::string serving_src  = models_.pool_member_template_source(job.model_id);
+    const std::string reformatted  = pool_reformat_body(rewritten, origin_template_hash, serving_hash, serving_src);
+    if (reformatted.empty()) {
+        post_error(job, "pre_token", "reformat_failed", "cross-template reformat failed");
+        return;
+    }
+
     int status = 0;
     std::string response;
-    if (!serve_child(job, rewritten, status, response)) {
+    if (!serve_child(job, reformatted, status, response)) {
         // an immediate child failure before any token: the coordinator re-offers (D-G1)
         const std::string code = (status == 413 || status == 400) ? "overflow" : "crash";
         post_error(job, "pre_token", code, status == 200 ? "child stream ended early" : "child request failed");
@@ -640,7 +655,11 @@ server_http_res_ptr pool_dispatch::origin_request(const std::string & tag, const
         streaming = body_json["stream"].get<bool>();
     }
 
-    // 1. intake the metadata (catalog 4)
+    // 1. intake the metadata (catalog 4). the origin's template identity
+    // (WS-17): the SHA-256 of the local member's template source - the member
+    // that would have served - or null when this router has no local member for
+    // the class. the serving side compares it to its own to skip or reformat
+    const std::string origin_template_hash = models_.pool_local_member_template_hash(tag);
     const json intake = {
         {"request_id", pool_request_id(raw_body)}, // D-G5: deterministic prompt hash
         {"tag", tag},
@@ -649,6 +668,7 @@ server_http_res_ptr pool_dispatch::origin_request(const std::string & tag, const
         {"priority", "live"},
         {"conv_key", json(pool_conv_key(raw_body))},
         {"client_hint", json(nullptr)},
+        {"origin_template_hash", origin_template_hash.empty() ? json(nullptr) : json(origin_template_hash)},
     };
     httplib::Client cli(cfg_.server);
     cli.set_connection_timeout(CONNECT_TIMEOUT_S);

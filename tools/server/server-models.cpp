@@ -12,6 +12,10 @@
 #include "subproc.h"
 
 #include "pool/pool-client.h"
+#include "pool/pool-reformat.h"
+
+#include "ggml-cpp.h"
+#include "gguf.h"
 
 #include <cpp-httplib/httplib.h> // TODO: remove this once we use HTTP client from download.h
 #include <optional>
@@ -475,6 +479,26 @@ static std::vector<std::string> get_environment() {
     return env;
 }
 
+// the chat template source of a GGUF file, read without loading the model. the
+// key is the one the model loader reads for the default template; "" when the
+// model has no built-in template (its family still renders, the empty source
+// is its identity). (WS-17)
+static std::string gguf_read_chat_template(const std::string & fname) {
+    struct gguf_init_params params = {
+        /* .no_alloc = */ true,
+        /* .ctx      = */ nullptr,
+    };
+    gguf_context_ptr ctx(gguf_init_from_file(fname.c_str(), params));
+    if (!ctx) {
+        return ""; // missing or unreadable file
+    }
+    const int64_t key = gguf_find_key(ctx.get(), "tokenizer.chat_template");
+    if (key < 0 || gguf_get_kv_type(ctx.get(), key) != GGUF_TYPE_STRING) {
+        return "";
+    }
+    return gguf_get_val_str(ctx.get(), key);
+}
+
 void server_model_meta::update_args(common_preset_context & ctx_preset, std::string bin_path) {
     // update params
     unset_reserved_args(preset, false);
@@ -546,6 +570,9 @@ void server_model_meta::update_caps(const common_params & base) {
         const bool can_chat = !gen_audio || info.has_chat_tmpl;
         output_modalities = server_model_output_modalities(info.decision_type, can_chat, gen_audio);
         n_ctx_train       = info.n_ctx_train;
+        // pool (WS-17): the member's chat template identity, read offline
+        chat_template_src  = gguf_read_chat_template(params.model.path);
+        chat_template_hash = pool::pool_template_hash(chat_template_src);
     }
 
     // offline discovery cannot see video; a loaded model reports it
@@ -1399,6 +1426,40 @@ std::vector<pool::pool_local_member> server_models::pool_local_members() {
         }
     }
     return out;
+}
+
+std::string server_models::pool_member_template_source(const std::string & model_name) {
+    auto meta = get_meta(model_name);
+    if (!meta.has_value()) {
+        return "";
+    }
+    return meta->chat_template_src;
+}
+
+std::string server_models::pool_member_template_hash(const std::string & model_name) {
+    auto meta = get_meta(model_name);
+    if (!meta.has_value()) {
+        return "";
+    }
+    return meta->chat_template_hash;
+}
+
+std::string server_models::pool_local_member_template_hash(const std::string & tag) {
+    std::vector<pool::pool_local_member> members;
+    try {
+        members = pool_local_members();
+    } catch (const std::exception &) {
+        return ""; // no local state
+    }
+    for (const auto & m : members) {
+        if (m.tag != tag) {
+            continue;
+        }
+        // the first loaded member carrying the class is the one that would
+        // have served it; its template identity is the class' identity here
+        return pool_member_template_hash(m.name);
+    }
+    return "";
 }
 
 void server_models::unload_lru() {

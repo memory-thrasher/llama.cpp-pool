@@ -95,6 +95,12 @@ struct server_model_meta {
     json architecture = server_model_architecture_json(false, false, false, {"text"});
     uint32_t n_ctx_train = 0; // trained context, read from the GGUF metadata; 0 when unknown
 
+    // pool (WS-17): the member's chat template source, read from the GGUF
+    // metadata offline; empty when the model has no built-in template. the
+    // sha-256 of it is the template identity the pool dispatch compares
+    std::string chat_template_src  = "";
+    std::string chat_template_hash = "";
+
     bool is_ready() const {
         return status == SERVER_MODEL_STATUS_LOADED;
     }
@@ -327,6 +333,15 @@ public:
     json pool_snapshot();
     // the loaded members carrying pool tags, one entry per (model, tag)
     std::vector<pool::pool_local_member> pool_local_members();
+    // pool (WS-17): the chat template of a member, read offline from the GGUF.
+    // the source is "" when the model has no built-in template (its family
+    // still renders, the hash of the empty source is its identity); "" also
+    // when the model is unknown. thread-safe
+    std::string pool_member_template_source(const std::string & model_name);
+    std::string pool_member_template_hash(const std::string & model_name);
+    // the template hash of the local member that would serve the class (the
+    // first loaded member carrying the tag); "" when no local member has it
+    std::string pool_local_member_template_hash(const std::string & tag);
 
     struct load_options {
         server_child_mode mode = SERVER_CHILD_MODE_NORMAL;

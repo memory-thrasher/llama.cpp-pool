@@ -74,10 +74,11 @@ private:
     // serving side, runs on the bus thread
     void on_envelope(const json & env);
     void handle_work_offer(const json & payload);
-    // one job per thread: pull, serve, push, then completion or error
+    // one job per thread: pull, rewrite, reformat (WS-17), serve, push, then
+    // completion or error
     void serve_job(std::string job_id, std::string tag, std::string model_id,
                    std::string conv_key, int64_t est_prompt_tokens, int64_t est_ctx_needed,
-                   uint64_t member_ctx);
+                   uint64_t member_ctx, std::string origin_template_hash);
 
     // membership + selection (D-C7, second check). returns true with the member
     // to serve, or false with the precise reject reason (never a body snippet)
