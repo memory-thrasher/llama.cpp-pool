@@ -11,6 +11,8 @@
 
 	/** "12 s ago", "1 m 05 s ago"; 0 means never in contact. */
 	function contactAge(ms: number): string {
+		if (ms === 0) return 'never';
+
 		const s = Math.floor(ms / 1000);
 
 		if (s < 10) return `${s} s ago`;

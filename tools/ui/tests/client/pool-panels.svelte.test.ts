@@ -108,6 +108,9 @@ describe('PoolMembersPanel', () => {
 
 		// scoped to the members card: the ids also appear in the Local models card below
 		const card = screen.container.querySelector('[aria-label="Pool members"]');
+		if (!card) {
+			throw new Error('the Pool members card is not rendered');
+		}
 
 		// the two pool members, in their states
 		expect(card?.textContent).toContain(POOLED);

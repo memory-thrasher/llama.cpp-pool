@@ -48,16 +48,17 @@ int64_t json_int(const json & o, const char * key, int64_t fallback) {
     return fallback;
 }
 
-// holds one slot of the serving-pending count (WS-16) for its scope: a job is
-// in flight from accept until its terminal, whichever path serve_job takes
-struct serving_pending_guard {
+// holds one slot of a pending counter (WS-16) for its scope: a serving job
+// is in flight from accept until its terminal, an originating relay is
+// pending from thread start until the relay is closed
+struct pending_guard {
     std::atomic<uint64_t> & pending;
 
-    explicit serving_pending_guard(std::atomic<uint64_t> & p) : pending(p) {
+    explicit pending_guard(std::atomic<uint64_t> & p) : pending(p) {
         pending.fetch_add(1, std::memory_order_relaxed);
     }
 
-    ~serving_pending_guard() {
+    ~pending_guard() {
         pending.fetch_sub(1, std::memory_order_relaxed);
     }
 };
@@ -433,7 +434,7 @@ void pool_dispatch::post_completion(pool_job_state & job, const std::string & re
 void pool_dispatch::serve_job(std::string job_id, std::string tag, std::string model_id,
                               std::string conv_key, int64_t est_prompt_tokens, int64_t est_ctx_needed,
                               uint64_t member_ctx) {
-    const serving_pending_guard pending(serving_pending_);
+    const pending_guard pending(serving_pending_);
     pool_job_state job;
     job.job_id   = job_id;
     job.tag      = tag;
@@ -721,7 +722,6 @@ server_http_res_ptr pool_dispatch::origin_request(const std::string & tag, const
     res->status = 200;
     res->content_type = streaming ? "text/event-stream" : "application/json; charset=utf-8";
     res->headers["X-Accel-Buffering"] = "no";
-    origin_pending_.fetch_add(1, std::memory_order_relaxed);
 
     // the terminal envelope of this job (completion / error, D-D6): the
     // coordinator mirrors it on the subscribe stream just before closing the
@@ -764,6 +764,7 @@ server_http_res_ptr pool_dispatch::origin_request(const std::string & tag, const
     const std::string token = cfg_.token;
     const std::string router_id = cfg_.router_id;
     res->thread = std::thread([this, pipe, job_id, cli2, token, router_id, streaming, term, term_token]() {
+        const pending_guard pending(origin_pending_);
         const httplib::Headers headers = {
             {"Authorization", "Bearer " + token},
             {"X-Pool-Proto", std::to_string(PROTO_VERSION)},
@@ -786,8 +787,6 @@ server_http_res_ptr pool_dispatch::origin_request(const std::string & tag, const
         }
         pipe->close_write();
         pool_instance().bus().unsubscribe(term_token);
-        // the relay is closed: the intake no longer counts as pending (WS-16)
-        origin_pending_.fetch_sub(1, std::memory_order_relaxed);
     });
 
     res->next = [pipe](std::string & out) -> bool {
