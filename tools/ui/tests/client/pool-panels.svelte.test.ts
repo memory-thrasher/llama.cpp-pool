@@ -105,9 +105,9 @@ describe('PoolMembersPanel', () => {
 		stubMembers();
 
 		const screen = await render(PoolMembersPanel);
-
 		// scoped to the members card: the ids also appear in the Local models card below
 		const card = screen.container.querySelector('[aria-label="Pool members"]');
+
 		if (!card) {
 			throw new Error('the Pool members card is not rendered');
 		}
@@ -119,6 +119,7 @@ describe('PoolMembersPanel', () => {
 		// the state badges: one offered, one withheld ('Withheld' is also a
 		// substring of the withheld model's id, so match the badge text exactly)
 		const badges = [...card.querySelectorAll('[data-slot="badge"]')].map((b) => b.textContent);
+
 		expect(badges).toContain('Offered');
 		expect(badges).toContain('Withheld');
 
@@ -164,7 +165,6 @@ describe('PoolMembersPanel', () => {
 		vi.spyOn(modelsStore, 'fetchRouterModels').mockResolvedValue(undefined);
 
 		const screen = await render(PoolMembersPanel);
-
 		const card = screen.container.querySelector('[aria-label="Pool members"]');
 
 		// only the loaded pool member is a row; the unloaded pool member and the

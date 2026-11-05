@@ -75,6 +75,9 @@ class _Job:
         self.body: bytes = b""
         # the held-open GET reads relayed lines from here; None closes the stream
         self.resp_queue: "queue.Queue" = queue.Queue()
+        # attached relay readers (the real coordinator's pipe close is observed
+        # by EVERY attached reader; the fake models it with one None each)
+        self.reader_count = 0
         self.pushed_lines: list[str] = []
         self.origin_router = ""
 
@@ -354,18 +357,30 @@ class FakeCoordinator:
             kept = [l for l in lines if l.strip() != "data: [DONE]"][: death["keep_lines"]]
             for line in kept:
                 job.resp_queue.put(line)
-            job.resp_queue.put(None)
+            self._close_relay(job)
             h._send_json({"ok": True})
             return
         # relay the lines to the held-open GET, in order, then close it
         for line in lines:
             job.resp_queue.put(line)
-        job.resp_queue.put(None)
+        self._close_relay(job)
         h._send_json({"ok": True})
+
+    def _close_relay(self, job: "_Job") -> None:
+        """the pipe close for the pushed lines: the real coordinator's relay pipe
+        close is observed by EVERY attached reader (the single channel: concurrent
+        readers steal lines from each other, but all of them see EOF), so the fake
+        sends one None sentinel per attached reader (never zero)"""
+        with self.lock:
+            readers = max(job.reader_count, 1)
+        for _ in range(readers):
+            job.resp_queue.put(None)
 
     def _get_response(self, h: "Handler", job_id: str) -> None:
         with self.lock:
             job = self.jobs.get(job_id)
+            if job is not None:
+                job.reader_count += 1
         if job is None:
             h._send_json({"error": "unknown job"}, 404)
             return
@@ -374,21 +389,25 @@ class FakeCoordinator:
         h.send_header("Cache-Control", "no-cache")
         h.send_header("Connection", "close")
         h.end_headers()
-        while True:
-            try:
-                line = job.resp_queue.get(timeout=5)
-            except queue.Empty:
-                h.wfile.write(f": hb {int(time.time() * 1000)}\n\n".encode())
-                h.wfile.flush()
-                continue
-            if line is None:
-                break
-            h.wfile.write(f"data: {line}\n\n".encode())
-            h.wfile.flush()
         try:
-            h.wfile.close()
-        except OSError:
-            pass
+            while True:
+                try:
+                    line = job.resp_queue.get(timeout=5)
+                except queue.Empty:
+                    h.wfile.write(f": hb {int(time.time() * 1000)}\n\n".encode())
+                    h.wfile.flush()
+                    continue
+                if line is None:
+                    break
+                h.wfile.write(f"data: {line}\n\n".encode())
+                h.wfile.flush()
+        finally:
+            with self.lock:
+                job.reader_count = max(job.reader_count - 1, 0)
+            try:
+                h.wfile.close()
+            except OSError:
+                pass
 
     def _subscribe(self, h: "Handler") -> None:
         if "text/event-stream" in h.headers.get("Accept", ""):
@@ -560,13 +579,13 @@ def _consume_stream(resp, state: dict) -> None:
 
 
 # start a generation on the model that keeps its (single) slot busy
-def _occupy_slot(server: ServerProcess, model_id: str):
+def _occupy_slot(server: ServerProcess, model_id: str, max_tokens: int = 300):
     req = requests.post(
         server.make_url("/v1/chat/completions"),
         json={
             "model": model_id,
             "stream": True,
-            "max_tokens": 300,
+            "max_tokens": max_tokens,
             "messages": [{"role": "user", "content": "Write a long story about a lighthouse keeper"}],
         },
         stream=True,
@@ -1041,6 +1060,114 @@ def test_request_id_determinism(tmp_path, coordinator):
         # the id is the sha-256 of the body (first 16 bytes, uuid-shaped)
         assert rid_a1 == _expected_request_id(body_a), rid_a1
         assert rid_b == _expected_request_id(body_b), rid_b
+    finally:
+        server.stop()
+
+
+def test_pool_two_readers_dedupe_relay(tmp_path, coordinator):
+    """RESID-WS12-1 contract pin: two concurrent byte-identical pool requests
+    (one user, one router) collapse to ONE pending job (the D-G5 dedupe on the
+    prompt-hash request_id), and both origin flows then hold the SAME
+    single-channel response relay open and read it concurrently. the accepted
+    residual: the two readers steal lines from each other, so WHICH client gets
+    which line is not pinned. what IS pinned (deterministic): both HTTP
+    responses 2xx, both streams terminate complete (well-formed NDJSON ending
+    in [DONE] - the reader that saw the child's [DONE] keeps it, the reader
+    that missed it gets the rendered network_error terminal, which also ends in
+    [DONE]), exactly one job for the pair, and no crash."""
+    preset = str(tmp_path / "preset.ini")
+    _write_preset(preset, LOCAL_MODEL_ID, POOL_TEXT_MD)
+    server = _start_router(tmp_path, coordinator.url(), preset)
+    try:
+        _load_model(server, LOCAL_MODEL_ID)
+        _wait_for_entry(server, POOL_TEXT_MD)
+        coordinator.wait_for("handshake", lambda e: True)
+        coordinator.wait_for_sse()
+
+        # the (single) slot stays busy long enough for both intakes to land and
+        # the job to remain pending while both relays are held open
+        t_long, _ = _occupy_slot(server, LOCAL_MODEL_ID, max_tokens=1500)
+        try:
+            payload = {
+                "model": POOL_TEXT_MD,
+                "stream": True,
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "Two readers, one relay. Say ok."}],
+            }
+
+            def _client(out: dict) -> None:
+                r = requests.post(
+                    server.make_url("/v1/chat/completions"),
+                    json=payload,
+                    stream=True,
+                    timeout=300,
+                )
+                out["status"] = r.status_code
+                out["lines"] = []
+                for line_bytes in r.iter_lines():
+                    line = line_bytes.decode("utf-8", "replace")
+                    if line:
+                        out["lines"].append(line)
+
+            # client A first: its intake registers the request_id and it holds
+            # the relay open; client B (the byte-identical retry) then intakes
+            # and dedupes onto A's still-pending job. the intakes are serialized
+            # on purpose - the D-G5 dedupe is deterministic that way, and the
+            # concurrency under test is the two-reader relay (the residual)
+            a: dict = {}
+            t_a = threading.Thread(target=_client, args=(a,), daemon=True)
+            t_a.start()
+            intake_a = _wait_intake(coordinator)
+            job_id = intake_a["job_id"]
+
+            # A's body is staged: A has passed intake + body PUT and holds the
+            # relay open
+            def _body_staged() -> bool:
+                with coordinator.lock:
+                    return job_id in coordinator.jobs and coordinator.jobs[job_id].body != b""
+
+            _wait_until(_body_staged, what="client A's staged body")
+
+            b: dict = {}
+            t_b = threading.Thread(target=_client, args=(b,), daemon=True)
+            t_b.start()
+            _wait_until(lambda: coordinator.intake_count() >= 2, what="client B's intake")
+            with coordinator.lock:
+                intakes = list(coordinator.intakes)
+            intake_b = intakes[-1]
+
+            # the D-G5 dedupe: B landed on A's job
+            assert intake_b["job_id"] == job_id, (intake_b["job_id"], job_id)
+
+            # free the slot; the pending job is offered back and served once
+            t_long.join(timeout=300)
+            coordinator.send_work_offer(
+                job_id, tag=POOL_TEXT_MD, est_ctx=256, est_prompt=16,
+                conv_key=intake_a["metadata"].get("conv_key"))
+
+            t_a.join(timeout=300)
+            t_b.join(timeout=300)
+
+            # both 2xx, both complete (the stream terminated)
+            assert a["status"] == 200, a
+            assert b["status"] == 200, b
+            assert a["lines"], "client A got no stream"
+            assert b["lines"], "client B got no stream"
+
+            # both streams are well-formed and terminated
+            for name, out in (("A", a), ("B", b)):
+                assert all(l.startswith("data: ") for l in out["lines"]), (name, out["lines"])
+                assert out["lines"][-1] == "data: [DONE]", (name, out["lines"][-3:])
+
+            # exactly one job for the pair (the dedupe)
+            assert len(coordinator.jobs) == 1, list(coordinator.jobs)
+            assert intake_a["job_id"] == intake_b["job_id"] == job_id
+
+            # no crash: the router still answers
+            res = server.make_request("GET", "/v1/models")
+            assert res.status_code == 200
+        finally:
+            t_long.join(timeout=300)
     finally:
         server.stop()
 

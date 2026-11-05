@@ -317,11 +317,20 @@ static const std::vector<tmpl_entry> TEMPLATES = {
     {"mistral", TPL_MISTRAL},
 };
 
-struct case_entry { const char * id; const char * messages; };
+struct case_entry {
+    const char * id;
+    const char * messages;
+    // the engine's contains_media branch flattens the parts to one string
+    // (documented cross-template multimodal limitation): the case pins that
+    bool flattens_media = false;
+};
 // the corpus: plain multi-turn; assistant tool_call + role:tool result;
 // reasoning_content present; typed text content parts (the engine's content
 // part types are text/media_marker; an image_url part is not one - the
-// pipeline test pins what the reformat does with it); and a mix of the above
+// pipeline test pins what the reformat does with it); parallel tool calls
+// (pi emits them in one assistant message); a media_marker part (the engine
+// flattens it - the case pins the flatten, not the structure); and a mix of
+// the above
 static const std::vector<case_entry> CORPUS = {
     {"plain-multi-turn",
      R"MSG([
@@ -363,6 +372,24 @@ static const std::vector<case_entry> CORPUS = {
         {"role": "tool", "tool_call_id": "call-x", "content": "{\"temp\": 22}"},
         {"role": "assistant", "content": "3*7 is 21, and it is 22 degrees in Tokyo."}
      ])MSG"},
+    {"parallel-tool-calls",
+     R"MSG([
+        {"role": "user", "content": "What is 6*7, and what is the weather in Paris?"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"type": "function", "id": "call-a", "function": {"name": "multiply", "arguments": "{\"a\":6,\"b\":7}"}},
+            {"type": "function", "id": "call-b", "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}}
+        ]},
+        {"role": "tool", "tool_call_id": "call-a", "content": "42"},
+        {"role": "tool", "tool_call_id": "call-b", "content": "{\"temp\": 18}"}
+     ])MSG"},
+    {"media-marker",
+     R"MSG([
+        {"role": "user", "content": [
+            {"type": "text", "text": "Describe this image: "},
+            {"type": "media_marker", "text": "[image]"}
+        ]}
+     ])MSG",
+     true},
 };
 
 namespace {
@@ -400,8 +427,26 @@ bool run_case(testing & t, const case_entry & c, const tmpl_entry & a, const tmp
         t.assert_true(std::string(a.name) + " -> " + b.name + " / " + c.id + ": re-parse failed: " + e.what(), false);
         return false;
     }
-    bool ok = pool::pool_canon_equal(kept, canonical_b);
-    t.assert_true(std::string(a.name) + " -> " + b.name + " / " + c.id + ": canonical equality after reformat", ok);
+    const std::string label = std::string(a.name) + " -> " + b.name + " / " + c.id + ": ";
+    bool ok;
+    if (c.flattens_media) {
+        // the engine's contains_media branch flattens the content parts to a
+        // single string - the documented cross-template multimodal limitation
+        // (the text survives, the part structure does not). pin the flatten
+        // and that the flattened form is a round-trip fixed point
+        const auto & content = serialized[0]["content"];
+        const bool flattened = content.is_string() &&
+            content.get<std::string>().find("[image]") != std::string::npos;
+        json reserialized = common_chat_msgs_to_json_oaicompat(canonical_b);
+        std::vector<common_chat_msg> fixed = common_chat_msgs_parse_oaicompat(reserialized);
+        const bool stable = pool::pool_canon_equal(canonical_b, fixed);
+        t.assert_true(label + "media parts flattened to one string (engine behavior)", flattened);
+        t.assert_true(label + "flattened round trip canonical-equal", stable);
+        ok = flattened && stable;
+    } else {
+        ok = pool::pool_canon_equal(kept, canonical_b);
+        t.assert_true(label + "canonical equality after reformat", ok);
+    }
 
     // the reasoning drop is expected on a non-reasoning B, kept on a reasoning B
     bool a_has_reasoning = false;
@@ -486,12 +531,22 @@ void test_reasoning_heuristic(testing & t) {
 
 
 // a quiet re-run for the per-template report (no assertions, bool only)
-bool run_case_quiet(const tmpl_entry & /* a */, const tmpl_entry & b, const case_entry & c) {
+bool run_case_quiet(const case_entry & c, const tmpl_entry & b) {
     try {
         std::vector<common_chat_msg> canonical_a = common_chat_msgs_parse_oaicompat(json::parse(c.messages));
         auto kept = kept_under(canonical_a, b.src);
         json serialized = common_chat_msgs_to_json_oaicompat(kept);
         std::vector<common_chat_msg> canonical_b = common_chat_msgs_parse_oaicompat(serialized);
+        if (c.flattens_media) {
+            // same pin as run_case, bool only
+            const auto & content = serialized[0]["content"];
+            if (!content.is_string() || content.get<std::string>().find("[image]") == std::string::npos) {
+                return false;
+            }
+            json reserialized = common_chat_msgs_to_json_oaicompat(canonical_b);
+            std::vector<common_chat_msg> fixed = common_chat_msgs_parse_oaicompat(reserialized);
+            return pool::pool_canon_equal(canonical_b, fixed);
+        }
         return pool::pool_canon_equal(kept, canonical_b);
     } catch (const std::exception &) {
         return false;
@@ -524,14 +579,12 @@ int main() {
     // serving target for holds)
     for (const auto & b : TEMPLATES) {
         int b_pass = 0;
-        for (const auto & a : TEMPLATES) {
-            for (const auto & c : CORPUS) {
-                if (run_case_quiet(a, b, c)) {
-                    b_pass++;
-                }
+        for (const auto & c : CORPUS) {
+            if (run_case_quiet(c, b)) {
+                b_pass++;
             }
         }
-        t.log(std::string("report: ") + b.name + " (serving) " + std::to_string(b_pass) + "/" + std::to_string(3 * CORPUS.size()) + " pass");
+        t.log(std::string("report: ") + b.name + " (serving) " + std::to_string(b_pass) + "/" + std::to_string(CORPUS.size()) + " pass");
     }
     t.assert_true("corpus: all " + std::to_string(total) + " (A,B,case) round trips hold", pass == total);
 
