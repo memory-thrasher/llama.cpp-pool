@@ -52,6 +52,7 @@
 /rpc-server
 /out/
 /tmp/
+/tools/server/tests/data/
 /autogen-*.md
 /common/build-info.cpp
 
