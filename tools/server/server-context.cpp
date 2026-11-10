@@ -1445,6 +1445,26 @@ private:
                 SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - capping\n",
                         n_ctx_capped, n_ctx_train);
             }
+
+            // boot compatibility check: the KV pool actually allocated must hold
+            // every slot's full advertised context, or a request that fits the
+            // advertised context can still exhaust the pool mid-generation
+            // ("Context size has been exceeded."). requested values can differ
+            // from actual values, so both are read back from the context
+            const uint32_t kv_pool   = llama_n_ctx(ctx_tgt);
+            const uint64_t kv_needed = (uint64_t) params_base.n_parallel * (uint64_t) n_ctx_slot();
+            if ((uint64_t) kv_pool < kv_needed) {
+                const uint32_t usable = kv_pool / (uint32_t) std::max(1, params_base.n_parallel);
+                SRV_ERR("boot check: KV pool holds %u tokens, but %d slot(s) x %d advertised context = %llu tokens - "
+                        "concurrent sessions can exhaust the pool mid-generation. "
+                        "usable per-slot context with %d slot(s) is ~%u; "
+                        "lower ctx-size to ~%u, lower parallel, or raise the KV pool\n",
+                        kv_pool, params_base.n_parallel, n_ctx_slot(), (unsigned long long) kv_needed,
+                        params_base.n_parallel, usable, usable);
+            } else {
+                SRV_INF("boot check: KV pool holds %u tokens >= %d slot(s) x %d advertised context = %llu - compatible\n",
+                        kv_pool, params_base.n_parallel, n_ctx_slot(), (unsigned long long) kv_needed);
+            }
         }
 
         slots.clear();
@@ -4585,7 +4605,10 @@ private:
                 // TODO: handle ret == 2 (abort) when we start aborting
 
                 if (!err.empty()) {
-                    SRV_ERR("%s off = %d, n_batch = %d, ret = %d\n", err.c_str(), off, n_batch, ret);
+                    const int n_prompt_tokens = slots.empty() ? 0 : (int) slots.front().task->n_tokens();
+                    const int n_ctx           = slots.empty() ? 0 : (int) slots.front().n_ctx;
+                    SRV_ERR("%s off = %d, n_batch = %d, ret = %d n_prompt_tokens = %d, n_ctx = %d\n",
+                            err.c_str(), off, n_batch, ret, n_prompt_tokens, n_ctx);
 
                     for (auto & slot : slots) {
                         if (slot.is_processing()) {
@@ -5152,6 +5175,19 @@ struct server_res_generator : server_res_spipe {
     void error(const json & error_data) {
         status = json_value(error_data, "code", 500);
         data = safe_json_to_str({{ "error", error_data }});
+        // log every failure sent to the client, with its size context when
+        // present (exceed_context_size carries n_prompt_tokens / n_ctx)
+        std::string extra;
+        if (error_data.contains("n_prompt_tokens") || error_data.contains("n_ctx")) {
+            extra = string_format(" n_prompt_tokens=%d n_ctx=%d",
+                                  (int) json_value(error_data, "n_prompt_tokens", 0),
+                                  (int) json_value(error_data, "n_ctx", 0));
+        }
+        SRV_WRN("client error response: status=%d type=%s message=\"%s\"%s\n",
+                status,
+                json_value(error_data, "type", std::string("unknown")).c_str(),
+                json_value(error_data, "message", std::string("")).c_str(),
+                extra.c_str());
     }
 };
 

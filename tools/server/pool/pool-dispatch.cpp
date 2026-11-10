@@ -501,8 +501,16 @@ struct server_http_pool_origin : server_http_res {
     std::shared_ptr<server_pipe<std::string>> pipe;
     std::shared_ptr<httplib::Client> cli;
     std::thread thread;
+    std::shared_ptr<std::atomic<bool>> ka_stop; // first real data sent, or relay ended
+    std::thread ka_thread;                      // client keep-alive while queued
 
     ~server_http_pool_origin() {
+        if (ka_stop) {
+            ka_stop->store(true, std::memory_order_relaxed);
+        }
+        if (ka_thread.joinable()) {
+            ka_thread.join();
+        }
         if (cli) {
             cli->stop(); // ends the held-open GET in the thread
         }
@@ -520,8 +528,11 @@ struct server_http_pool_origin : server_http_res {
 // saw_done records the child's stream terminator ("data: [DONE]") - the
 // local signal that the served stream finished, for the client-facing
 // terminal (D-G2)
+// first_data: set once the first "data:" line is forwarded - stops the
+// client keep-alive (see origin_request)
 static bool sse_feed_response(const char * data, size_t len, std::string & buf,
-                              server_pipe<std::string> & pipe, bool & saw_done) {
+                              server_pipe<std::string> & pipe, bool & saw_done,
+                              std::atomic<bool> * first_data = nullptr) {
     buf.append(data, len);
     size_t start = 0;
     while (true) {
@@ -544,6 +555,9 @@ static bool sse_feed_response(const char * data, size_t len, std::string & buf,
         payload += '\n'; // the client reads line oriented
         if (payload == "data: [DONE]\n") {
             saw_done = true;
+        }
+        if (first_data) {
+            first_data->store(true, std::memory_order_relaxed);
         }
         if (!pipe.write(std::move(payload))) {
             return false;
@@ -622,19 +636,21 @@ static void render_interrupted_terminal(server_pipe<std::string> & pipe, bool st
     }
     // the coordinator says the job failed: render with its reason
     if (is_error) {
-        if (!message.empty()) {
-            render_interrupted(pipe, streaming, "pool: " + message);
-        } else {
-            render_interrupted(pipe, streaming, "pool: response ended without completion");
-        }
+        const std::string reason = message.empty()
+                                       ? "pool: response ended without completion"
+                                       : "pool: " + message;
+        LOG_WRN("pool: client-facing terminal (error): %s\n", reason.c_str());
+        render_interrupted(pipe, streaming, reason);
         return;
     }
     // the coordinator says the job completed: the stream stands as is. a
     // stream with NO terminal event in time ended as an interruption; a blob
     // stands as is (its body either parsed or it did not)
     if (streaming && !have) {
-        render_interrupted(pipe, streaming,
-            "pool: response ended without completion (serving member may have failed)");
+        const std::string reason =
+            "pool: response ended without completion (serving member may have failed)";
+        LOG_WRN("pool: client-facing terminal (interrupted): %s\n", reason.c_str());
+        render_interrupted(pipe, streaming, reason);
     }
 }
 
@@ -781,9 +797,32 @@ server_http_res_ptr pool_dispatch::origin_request(const std::string & tag, const
     cli2->set_read_timeout(READ_TIMEOUT_S); // held open until the relay is terminal
     cli2->set_write_timeout(CONNECT_TIMEOUT_S);
     res->cli = cli2;
+
+    // keep the client's idle timer alive while the job is queued or waiting
+    // for the first token (the relay sends nothing until then; pi's default
+    // http idle timeout is 30s): one SSE comment per 15s, stream requests
+    // only - comment lines are ignored by OpenAI-compatible parsers
+    if (streaming) {
+        auto ka_stop = std::make_shared<std::atomic<bool>>(false);
+        res->ka_stop = ka_stop;
+        res->ka_thread = std::thread([pipe, ka_stop]() {
+            int secs = 0;
+            while (secs < 1800) { // bounded: the job expiry (30min default) ends the relay
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                if (ka_stop->load(std::memory_order_relaxed) || ++secs >= 1800) {
+                    break;
+                }
+                if (secs % 15 == 0 && !pipe->write(": keepalive\n\n")) {
+                    break; // the reader is gone
+                }
+            }
+        });
+    }
+
     const std::string token = cfg_.token;
     const std::string router_id = cfg_.router_id;
-    res->thread = std::thread([this, pipe, job_id, cli2, token, router_id, streaming, term, term_token]() {
+    res->thread = std::thread([this, pipe, job_id, cli2, token, router_id, streaming, term, term_token,
+                                ka_stop = res->ka_stop]() {
         const pending_guard pending(origin_pending_);
         const httplib::Headers headers = {
             {"Authorization", "Bearer " + token},
@@ -796,7 +835,7 @@ server_http_res_ptr pool_dispatch::origin_request(const std::string & tag, const
         cli2->Get("/pool/jobs/" + job_id + "/response", headers,
                   [](const httplib::Response &) -> bool { return true; },
                   [&](const char * d, size_t len) -> bool {
-                      return sse_feed_response(d, len, sse_buf, *pipe, saw_done);
+                      return sse_feed_response(d, len, sse_buf, *pipe, saw_done, ka_stop ? ka_stop.get() : nullptr);
                   });
         // the relay ended: a stream that never saw the child's [DONE] is an
         // interruption (the serving member died mid-push) - render the clean,
@@ -804,6 +843,9 @@ server_http_res_ptr pool_dispatch::origin_request(const std::string & tag, const
         // needs no terminal wait; a blob renders only on an error event
         if (!streaming || !saw_done) {
             render_interrupted_terminal(*pipe, streaming, term);
+        }
+        if (ka_stop) {
+            ka_stop->store(true, std::memory_order_relaxed);
         }
         pipe->close_write();
         pool_instance().bus().unsubscribe(term_token);
