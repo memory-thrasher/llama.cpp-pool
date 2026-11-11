@@ -3958,7 +3958,7 @@ private:
                                 send_error(
                                     slot,
                                     string_format(
-                                        "input (%d tokens) is larger than the max context size (%d tokens). skipping",
+                                        "input (%d tokens) exceeds the available context size (%d tokens). skipping",
                                         slot.task->n_tokens(), slot.n_ctx),
                                     ERROR_TYPE_EXCEED_CONTEXT_SIZE);
                                 slot.release();
@@ -4590,7 +4590,9 @@ private:
                 if (n_batch == 1 && ret == 1) {
                     // TODO: try to terminate only the largest active slot/sequence and continue with the rest
                     //       need to remove the tokens from the current batch too
-                    err = "Context size has been exceeded.";
+                    // the second sentence matches the pre-check wording so that clients
+                    // (e.g. pi) recognize it as a context overflow and compact-and-retry
+                    err = "Context size has been exceeded. The request exceeds the available context size.";
                 }
 
                 if (ret == -1) {
@@ -4607,12 +4609,14 @@ private:
                 if (!err.empty()) {
                     const int n_prompt_tokens = slots.empty() ? 0 : (int) slots.front().task->n_tokens();
                     const int n_ctx           = slots.empty() ? 0 : (int) slots.front().n_ctx;
+                    // a decode-time overflow is a context error: clients get the token sizes
+                    const enum error_type err_type = (n_batch == 1 && ret == 1) ? ERROR_TYPE_EXCEED_CONTEXT_SIZE : ERROR_TYPE_SERVER;
                     SRV_ERR("%s off = %d, n_batch = %d, ret = %d n_prompt_tokens = %d, n_ctx = %d\n",
                             err.c_str(), off, n_batch, ret, n_prompt_tokens, n_ctx);
 
                     for (auto & slot : slots) {
                         if (slot.is_processing()) {
-                            send_error(slot, err);
+                            send_error(slot, err, err_type);
                             slot.release();
 
                             // note: it's complicated to keep track of how much of the current batch has been
