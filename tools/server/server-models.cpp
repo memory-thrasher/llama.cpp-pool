@@ -2832,6 +2832,13 @@ void server_models_routes::init_routes() {
                     {"created",       t},
                     {"status",        json {{"value", "loaded"}, {"args", ""}}},
                     {"context_length", ad.advertised_ctx},
+                    // pi (stock) reads meta.n_ctx first for the context window and
+                    // falls back to a 128000 default without it; keep it in sync
+                    // with the advertised context
+                    {"meta",          json {
+                        {"n_ctx",       ad.advertised_ctx},
+                        {"n_ctx_train", ad.advertised_ctx},
+                    }},
                     // additive metadata for the pool, harmless to other clients
                     {"pool",          json {
                         {"member_count", ad.member_count},

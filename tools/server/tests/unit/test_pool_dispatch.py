@@ -633,6 +633,23 @@ def test_dispatch_local_first_no_intake(tmp_path, coordinator):
         server.stop()
 
 
+def test_class_entry_meta_nctx(tmp_path, coordinator):
+    """stock pi derives contextWindow from meta.n_ctx first and falls back to a
+    128000 default (stuck in its model store) when the entry has no meta; the
+    class entry must carry meta.n_ctx in sync with the advertised context"""
+    preset = str(tmp_path / "preset.ini")
+    _write_preset(preset, LOCAL_MODEL_ID, POOL_TEXT_MD)
+    server = _start_router(tmp_path, coordinator.url(), preset)
+    try:
+        _load_model(server, LOCAL_MODEL_ID)
+        entry = _wait_for_entry(server, POOL_TEXT_MD)
+        assert entry["context_length"] == 1024
+        assert entry["meta"]["n_ctx"] == 1024
+        assert entry["meta"]["n_ctx_train"] == 1024
+    finally:
+        server.stop()
+
+
 def test_dispatch_offer_reject_no_slot(tmp_path, coordinator):
     """C: an offer for a tag the router has but with no free slot is rejected
     with the precise reason no_slot"""
