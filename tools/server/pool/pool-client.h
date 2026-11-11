@@ -59,6 +59,9 @@ public:
     bool link_open() const;
     // milliseconds since the last subscribe event or heartbeat; 0 when never in contact
     uint64_t ms_since_last_contact() const;
+    // latched on the first successful subscribe round (SSE or long-poll); the
+    // router's startup gate waits for this when a coordinator is configured
+    bool established() const;
 
     pool_event_bus & bus() { return bus_; }
 

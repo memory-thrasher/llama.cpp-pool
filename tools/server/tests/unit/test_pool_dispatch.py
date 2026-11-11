@@ -912,6 +912,50 @@ def test_dispatch_retry_coordinator_down(tmp_path):
         server.stop()
 
 
+def test_startup_gate_dead_coordinator_fails_router(tmp_path):
+    """startup gate: with --pool-server configured, a coordinator that cannot
+    be reached at startup must fail the router (non-zero exit) instead of a
+    router serving clients without a pool link. POOL_READY_TIMEOUT_MS keeps
+    the test fast"""
+    preset = str(tmp_path / "preset.ini")
+    _write_preset(preset, LOCAL_MODEL_ID, POOL_TEXT_MD)
+    models_dir = tmp_path / "models"
+    models_dir.mkdir(exist_ok=True)
+    os.environ["LLAMA_POOL_TOKEN"] = POOL_TOKEN
+    os.environ["POOL_READY_TIMEOUT_MS"] = "4000"
+    server = ServerPreset.router()
+    server.models_dir = str(models_dir)
+    server.models_preset = preset
+    server.pool_server = "http://127.0.0.1:9"  # dead port: nothing listens
+    server.pool_name = ROUTER_NAME
+    server.log_path = str(tmp_path / "server.log")
+    try:
+        with pytest.raises(RuntimeError, match=r"died with return code [1-9]"):
+            server.start()
+        with open(server.log_path, errors="replace") as f:
+            log = f.read()
+        assert "coordinator link not established" in log, log[-4000:]
+    finally:
+        os.environ.pop("POOL_READY_TIMEOUT_MS", None)
+        server.stop()
+
+
+def test_startup_gate_established_before_accepting_load(tmp_path, coordinator):
+    """startup gate, success path: the router only accepts client load after
+    the first successful subscribe round; both log lines must appear, in
+    order"""
+    preset = str(tmp_path / "preset.ini")
+    _write_preset(preset, LOCAL_MODEL_ID, POOL_TEXT_MD)
+    server = _start_router(tmp_path, coordinator.url(), preset)
+    try:
+        log = _wait_log(server, "pool: link established - accepting client load")
+        contact = log.index("pool: link established (first contact with the coordinator)")
+        gate = log.index("pool: link established - accepting client load")
+        assert contact < gate
+    finally:
+        server.stop()
+
+
 def test_dispatch_mid_stream_death(tmp_path, coordinator):
     """A.4/D-G2: the stream started and then the serving member died (the
     coordinator's running cap cut the relay and mirrored the terminal error).

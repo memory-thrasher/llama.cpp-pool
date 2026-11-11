@@ -93,6 +93,44 @@ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t 
     };
 }
 
+// router startup gate (only when --pool-server is set): wait until the pool
+// link has its first successful round (SSE or long-poll). a pool router must
+// not accept client load before the coordinator connection is established,
+// and a coordinator it cannot reach in time fails the startup. the deadline
+// is generous so a busy host (cold start, model loads in flight) can settle
+// before the link is declared a failure; POOL_READY_TIMEOUT_MS overrides it.
+// a link that drops AFTER startup keeps being retried by the pool thread
+// (backoff) and does not stop the server
+static bool wait_for_pool_ready() {
+    int64_t timeout_ms = 300000;
+    const char * env = std::getenv("POOL_READY_TIMEOUT_MS");
+    if (env && *env) {
+        const int64_t parsed = std::strtoll(env, nullptr, 10);
+        if (parsed > 0) {
+            timeout_ms = parsed;
+        }
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    int quiet_s = 0;
+    while (!pool::pool_instance().established()) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            SRV_WRN("pool: coordinator link not established after %lld ms (POOL_READY_TIMEOUT_MS) - "
+                    "check the coordinator and its database; the router will not start\n",
+                    (long long) timeout_ms);
+            return false;
+        }
+        quiet_s++;
+        if (quiet_s >= 15) {
+            quiet_s = 0;
+            SRV_INF("pool: waiting for the coordinator link to establish (up to %lld ms)\n",
+                    (long long) timeout_ms);
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+    SRV_INF("%s", "pool: link established - accepting client load\n");
+    return true;
+}
+
 int llama_server(int argc, char ** argv) {
     server_child child;
 
@@ -473,6 +511,35 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
             llama_backend_free();
         };
 
+        try {
+            models_routes->models.load_startup_models();
+        } catch (const std::exception & e) {
+            SRV_ERR("failed to load models on startup: %s\n", e.what());
+            clean_up();
+            return 1;
+        }
+
+        // pool control channel; started after the startup models so the first handshake
+        // already carries them. a no-op path when --pool-server is not set
+        if (!params.pool_server.empty()) {
+            std::string pool_start_err;
+            if (!pool::pool_instance().start(pool_cfg, [&models_routes]() {
+                    return models_routes->models.pool_snapshot();
+                }, pool_start_err)) {
+                SRV_ERR("pool: failed to start: %s\n", pool_start_err.c_str());
+                clean_up();
+                return 1;
+            }
+            // startup gate: with a coordinator configured, the pool link must
+            // be established before the router starts accepting client load
+            if (!wait_for_pool_ready()) {
+                clean_up();
+                return 1;
+            }
+        } else {
+            SRV_INF("%s", "pool: not configured (no --pool-server)\n");
+        }
+
         if (!ctx_http.start()) {
             clean_up();
             SRV_ERR("%s", "exiting due to HTTP server error\n");
@@ -488,33 +555,6 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
             mcp_mgr.shutdown();
             ctx_http.stop();
         };
-
-        try {
-            models_routes->models.load_startup_models();
-        } catch (const std::exception & e) {
-            SRV_ERR("failed to load models on startup: %s\n", e.what());
-            ctx_http.stop();
-            ctx_http.join();
-            clean_up();
-            return 1;
-        }
-
-        // pool control channel; started after the startup models so the first handshake
-        // already carries them. a no-op path when --pool-server is not set
-        if (!params.pool_server.empty()) {
-            std::string pool_start_err;
-            if (!pool::pool_instance().start(pool_cfg, [&models_routes]() {
-                    return models_routes->models.pool_snapshot();
-                }, pool_start_err)) {
-                SRV_ERR("pool: failed to start: %s\n", pool_start_err.c_str());
-                ctx_http.stop();
-                ctx_http.join();
-                clean_up();
-                return 1;
-            }
-        } else {
-            SRV_INF("%s", "pool: not configured (no --pool-server)\n");
-        }
 
     } else {
         // setup clean up function, to be called before exit

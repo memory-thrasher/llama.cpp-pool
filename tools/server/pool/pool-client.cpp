@@ -30,7 +30,10 @@ const int POLL_READ_TIMEOUT_S = 60;
 const int CONNECT_TIMEOUT_S = 10;
 // event POSTs must not block the caller long
 const int EVENT_TIMEOUT_S = 5;
-const int BACKOFF_MAX_S = 60;
+// retry backoff ceiling for a dropped link: about 5 minutes (owner decision
+// 2026-11-11) - a pool router with a dead coordinator keeps serving locally
+// and keeps retrying, but must not hammer the coordinator
+const int BACKOFF_MAX_S = 300;
 // a stream that closes almost right after connecting is treated as a failed
 // round, so the backoff keeps growing instead of spinning
 const int MIN_ROUND_S = 2;
@@ -112,6 +115,7 @@ struct pool_client::state {
     // round (SSE stream or held long-poll) is in flight; last_contact is the
     // steady-clock ms of the newest inbound event or heartbeat (0 = never)
     std::atomic<bool> link{false};
+    std::atomic<bool> established{false}; // latched on the first successful round
     std::atomic<uint64_t> last_contact{0};
 
     void note_contact() {
@@ -323,6 +327,9 @@ struct pool_client::state {
                 connected = true;
                 link = true;
                 note_contact();
+                if (!established.exchange(true)) {
+                    LOG_INF("pool: link established (first contact with the coordinator)\n");
+                }
                 return true;
             },
             [&buf, &data, this](const char * d, size_t len) -> bool {
@@ -435,6 +442,9 @@ struct pool_client::state {
             return false;
         }
         note_contact(); // a successful round is the contact in this mode
+        if (!established.exchange(true)) {
+            LOG_INF("pool: link established (first contact with the coordinator)\n");
+        }
         json offers;
         try {
             offers = json::parse(res->body);
@@ -551,6 +561,10 @@ bool pool_client::link_open() const {
 
 uint64_t pool_client::ms_since_last_contact() const {
     return st ? st->ms_since_last_contact() : 0;
+}
+
+bool pool_client::established() const {
+    return st ? st->established.load() : false;
 }
 
 const pool_config * pool_client::config() const {
