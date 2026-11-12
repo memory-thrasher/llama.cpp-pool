@@ -1233,39 +1233,51 @@ def test_pool_two_readers_dedupe_relay(tmp_path, coordinator):
         server.stop()
 
 
-def test_exclusion_mark_flow(tmp_path, coordinator):
-    """D-F1: /models/unload on a loaded pool member is an exclusion mark, not a
-    real unload (the coordinator gets exclusion_update(excluded=true), the model
-    stays loaded, /models reports "excluded"). /models/load on the excluded
-    member unmarks it (exclusion_update(excluded=false), no reload, status back
-    to loaded)"""
+def test_unload_pool_member_real_unload(tmp_path, coordinator):
+    """owner decision 2026-11-12: /models/unload on a loaded pool member is a
+    REAL unload on this router only (no exclusion mark, no cross-router
+    dispatch). the status becomes "unloaded", which is what pi's TUI unload
+    flow polls for. /models/load re-spawns the member"""
     preset = str(tmp_path / "preset.ini")
     _write_preset(preset, LOCAL_MODEL_ID, POOL_TEXT_MD)
     server = _start_router(tmp_path, coordinator.url(), preset)
     try:
         _load_model(server, LOCAL_MODEL_ID)
         _wait_for_entry(server, LOCAL_MODEL_ID)
-        router_id = coordinator.wait_for("handshake", lambda e: True)["payload"]["router_id"]
 
-        # unload the pool member: it is marked excluded, not really unloaded
         res = server.make_request("POST", "/models/unload", data={"model": LOCAL_MODEL_ID})
         assert res.status_code == 200, res.body
         assert res.body.get("success") is True
-        excl_on = coordinator.wait_for("exclusion_update", lambda e:
-            e["payload"]["model_id"] == LOCAL_MODEL_ID and e["payload"]["excluded"] is True)
-        assert excl_on["payload"]["router_id"] == router_id
-        # the model stays loaded and now reports "excluded"
-        _wait_model_status(server, LOCAL_MODEL_ID, "excluded")
+        # really unloaded: the TUI wait condition (status "unloaded") is met
+        _wait_model_status(server, LOCAL_MODEL_ID, "unloaded")
+        # no exclusion mark was set
+        assert coordinator.received_of("exclusion_update") == [], "no exclusion event for a real unload"
 
-        # load the excluded member: it is unmarked, not re-loaded
+        # /models/load re-spawns the member
         res = server.make_request("POST", "/models/load", data={"model": LOCAL_MODEL_ID})
         assert res.status_code == 200, res.body
         assert res.body.get("success") is True
-        excl_off = coordinator.wait_for("exclusion_update", lambda e:
-            e["payload"]["model_id"] == LOCAL_MODEL_ID and e["payload"]["excluded"] is False)
-        assert excl_off["payload"]["router_id"] == router_id
-        # back to loaded (the model was never unloaded, so no real reload ran)
         _wait_model_status(server, LOCAL_MODEL_ID, "loaded")
+    finally:
+        server.stop()
+
+
+def test_unload_class_tag_noop(tmp_path, coordinator):
+    """owner decision 2026-11-12: /models/unload on a class tag is a no-op that
+    answers success (it used to be a 400); the members are untouched"""
+    preset = str(tmp_path / "preset.ini")
+    _write_preset(preset, LOCAL_MODEL_ID, POOL_TEXT_MD)
+    server = _start_router(tmp_path, coordinator.url(), preset)
+    try:
+        _load_model(server, LOCAL_MODEL_ID)
+        _wait_for_entry(server, LOCAL_MODEL_ID)
+
+        res = server.make_request("POST", "/models/unload", data={"model": POOL_TEXT_MD})
+        assert res.status_code == 200, res.body
+        assert res.body.get("success") is True
+        # nothing changed: the member is still loaded, no events were posted
+        _wait_model_status(server, LOCAL_MODEL_ID, "loaded")
+        assert coordinator.received_of("exclusion_update") == []
     finally:
         server.stop()
 

@@ -2862,34 +2862,24 @@ void server_models_routes::init_routes() {
         std::string name = json_value(body, "model", std::string());
         auto model = models.get_meta(name);
         if (!model.has_value()) {
-            // a pool class tag is a virtual entry, not a real model: the owner
-            // marks the member model, not the class (D-F1)
+            // a pool class tag is a virtual entry, not a real model: unloading
+            // the class is a no-op (owner decision 2026-11-12); the members
+            // are unloaded one by one
             if (name.rfind("pool-", 0) == 0) {
-                res_err(res, format_error_response("a class tag has no real model to unload; mark the member model instead", ERROR_TYPE_INVALID_REQUEST));
+                res_ok(res, {{"success", true}});
                 return res;
             }
             res_err(res, format_error_response("model is not found", ERROR_TYPE_INVALID_REQUEST));
-            return res;
-        }
-        // a loaded pool member: the unload is an owner exclusion mark, not a
-        // real unload (D-F1). the model stays loaded; the coordinator avoids it
-        // for this owner's class requests
-        bool has_pool_tag = false;
-        for (const auto & tag : model->tags) {
-            if (tag.rfind("pool-", 0) == 0) {
-                has_pool_tag = true;
-                break;
-            }
-        }
-        if (model->is_running() && has_pool_tag) {
-            pool_dispatch->mark_excluded(model->name);
-            res_ok(res, {{"success", true}});
             return res;
         }
         if (!model->is_running() && model->status != SERVER_MODEL_STATUS_DOWNLOADING) {
             res_err(res, format_error_response("model is not running", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
+        // a loaded pool member unloads for real (owner decision 2026-11-12):
+        // this router only, no cross-router dispatch. the capacity event drops
+        // the member from the class. pi's TUI unload flow polls for status
+        // "unloaded" and completes
         models.unload(model->name);
         res_ok(res, {{"success", true}});
         return res;
