@@ -524,7 +524,11 @@ struct server_http_pool_origin : server_http_res {
 };
 
 // feed the held-open response stream; emit the payload of each completed
-// "data:" line to the pipe, line terminated. heartbeats and blanks are dropped.
+// "data:" line to the pipe, each followed by its terminating blank line
+// (the client's SSE parser ends an event on a blank line; a stream of bare
+// single-newline data lines parses as one giant non-JSON event - the "
+// malformed server-sent event JSON" error in pi, KI-2). heartbeats and
+// blanks are dropped.
 // saw_done records the child's stream terminator ("data: [DONE]") - the
 // local signal that the served stream finished, for the client-facing
 // terminal (D-G2)
@@ -552,8 +556,10 @@ static bool sse_feed_response(const char * data, size_t len, std::string & buf,
         if (!payload.empty() && payload[0] == ' ') {
             payload.erase(0, 1);
         }
-        payload += '\n'; // the client reads line oriented
-        if (payload == "data: [DONE]\n") {
+        // data line + terminating blank line, exactly like the child's own
+        // framing on the local (non-relayed) path
+        payload += "\n\n";
+        if (payload == "data: [DONE]\n\n") {
             saw_done = true;
         }
         if (first_data) {
@@ -605,9 +611,10 @@ static void render_interrupted(server_pipe<std::string> & pipe, bool streaming, 
             {"error", error_field},
         };
         const json error_chunk = {{"error", error_field}};
-        pipe.write("data: " + finish_chunk.dump() + "\n");
-        pipe.write("data: " + error_chunk.dump() + "\n");
-        pipe.write("data: [DONE]\n");
+        // each line needs its own terminating blank line (see sse_feed_response)
+        pipe.write("data: " + finish_chunk.dump() + "\n\n");
+        pipe.write("data: " + error_chunk.dump() + "\n\n");
+        pipe.write("data: [DONE]\n\n");
     } else {
         pipe.write("\n" + safe_json_to_str({{"error", error_field}}) + "\n");
     }

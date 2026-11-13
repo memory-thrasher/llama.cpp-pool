@@ -792,6 +792,95 @@ def test_dispatch_origin_serve_roundtrip(tmp_path, coordinator):
         server.stop()
 
 
+def test_relay_sse_framing_blank_lines(tmp_path, coordinator):
+    """KI-2 root cause: the relayed stream must frame each data line with its
+    own terminating blank line. pi's SSE decoder ends an event only on a blank
+    line, so a stream of single-newline data lines parses as ONE event whose
+    data is all the lines joined by "\n" - JSON.parse fails with "malformed
+    server-sent event JSON" on every cross-router relay (the local path is a
+    raw byte proxy and keeps the child's own \\n\\n framing, which is why only
+    relays were broken)."""
+    preset = str(tmp_path / "preset.ini")
+    _write_preset(preset, LOCAL_MODEL_ID, POOL_TEXT_MD)
+    server = _start_router(tmp_path, coordinator.url(), preset)
+    try:
+        _load_model(server, LOCAL_MODEL_ID)
+        _wait_for_entry(server, POOL_TEXT_MD)
+        router_id = coordinator.wait_for("handshake", lambda e: True)["payload"]["router_id"]
+        coordinator.wait_for_sse()
+
+        t_long, _ = _occupy_slot(server, LOCAL_MODEL_ID)
+        try:
+            raw: dict = {}
+
+            def _client() -> None:
+                r = requests.post(
+                    server.make_url("/v1/chat/completions"),
+                    json={
+                        "model": POOL_TEXT_MD,
+                        "stream": True,
+                        "max_tokens": 32,
+                        "messages": [{"role": "user", "content": PROMPT_MARKER + " framing probe"}],
+                    },
+                    stream=True,
+                    timeout=180,
+                )
+                raw["status"] = r.status_code
+                raw["bytes"] = b""
+                if r.status_code == 200:
+                    for chunk in r.iter_content(chunk_size=None):
+                        raw["bytes"] += chunk
+
+            t_client = threading.Thread(target=_client, daemon=True)
+            t_client.start()
+
+            intake = _wait_intake(coordinator)
+            job_id = intake["job_id"]
+            t_long.join(timeout=180)
+            coordinator.send_work_offer(job_id, tag=POOL_TEXT_MD, est_ctx=256, est_prompt=32,
+                                        conv_key=intake["metadata"]["conv_key"])
+            t_client.join(timeout=180)
+            assert raw["status"] == 200, raw.get("bytes", b"")[:200]
+
+            data = raw["bytes"].decode("utf-8", "replace")
+            lines = data.split("\n")
+            # every data line is followed by its terminating blank line
+            bad = []
+            for i, line in enumerate(lines):
+                if line.startswith("data: ") and (i + 1 >= len(lines) or lines[i + 1] != ""):
+                    bad.append(i)
+            assert not bad, f"data lines without a terminating blank line: indices {bad[:5]} of {len(lines)}"
+            assert data.endswith("data: [DONE]\n\n"), repr(data[-40:])
+
+            # and the stream parses the way pi's SSEDecoder parses it: one
+            # event per blank-line-terminated data line, every event valid JSON
+            events = []
+            cur = []
+            for line in lines:
+                if not line:
+                    if cur:
+                        events.append("\n".join(cur))
+                        cur = []
+                    continue
+                if line.startswith(":"):
+                    continue
+                if line.startswith("data:"):
+                    cur.append(line[5:].lstrip(" "))
+            events.append("\n".join(cur))
+            parsed = 0
+            for ev in events:
+                if ev == "[DONE]":
+                    break
+                obj = json.loads(ev)  # raises on the old (broken) framing
+                assert "error" not in obj, obj
+                parsed += 1
+            assert parsed >= 2, f"only {parsed} parseable events"
+        finally:
+            t_long.join(timeout=180)
+    finally:
+        server.stop()
+
+
 #
 # WS-09 Part A: the D-J5 error taxonomy (hold / give-up / retry / interrupted)
 #
